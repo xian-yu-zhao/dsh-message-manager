@@ -1,0 +1,49 @@
+{
+  "name": "@local/dsh-message-manager",
+  "version": "1.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Manage, batch-delete, and restore individual messages in a DSH session without deleting the raw session log.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xian-yu-zhao/dsh-message-manager.git"
+  },
+  "homepage": "https://github.com/xian-yu-zhao/dsh-message-manager",
+  "bugs": {
+    "url": "https://github.com/xian-yu-zhao/dsh-message-manager/issues"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "core.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-api-remotes",
+        "@deepseek-ai/dsh-api-session-controller",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-session"
+      ]
+    }
+  }
+}

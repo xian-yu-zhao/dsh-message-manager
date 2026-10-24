@@ -1,0 +1,3 @@
+- insert:
+    - id: message-manager
+      name: '@local/dsh-message-manager'

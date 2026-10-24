@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Session Message Manager",
+    "description": "Manage session messages from the header and delete individual messages while keeping the raw session log."
+  }
+}

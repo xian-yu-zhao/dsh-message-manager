@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Session Message Manager">
+  <defs>
+    <linearGradient id="dshmm-bg" x1="8" y1="6" x2="56" y2="58" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#3b82f6"/>
+      <stop offset="1" stop-color="#1d4ed8"/>
+    </linearGradient>
+  </defs>
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="url(#dshmm-bg)"/>
+  <g fill="#ffffff">
+    <rect x="13" y="16" width="30" height="5" rx="2.5" opacity="0.96"/>
+    <rect x="13" y="26" width="24" height="5" rx="2.5" opacity="0.9"/>
+    <rect x="13" y="36" width="17" height="5" rx="2.5" opacity="0.82"/>
+  </g>
+  <g transform="translate(36 34)">
+    <rect x="0" y="2" width="19" height="20" rx="4.5" fill="#ef4444" stroke="#ffffff" stroke-width="1.6"/>
+    <path d="M5.5 2V0.8h8V2" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round"/>
+    <path d="M6.2 7v9.5M9.5 7v9.5M12.8 7v9.5" fill="none" stroke="#ffffff" stroke-width="1.8" stroke-linecap="round" opacity="0.92"/>
+  </g>
+</svg>
