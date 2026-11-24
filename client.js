@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Client half of the Session Message Manager.
  *
  * The header utility opens a frame-wide dialog listing the messages currently
@@ -69,6 +69,17 @@ window.__ModuleLoader__.load({
       deletedRecord: '删除记录 #{seq}',
       selected: '已选 {count}',
       unavailable: '不可恢复',
+      confirmTotal: '共移除 {count} 条消息',
+      turnsSection: '对话轮（整轮删除）',
+      turnBadge: '轮 {turn}',
+      deleteTurn: '删除本轮',
+      confirmBatchTurns: '确认删除选中的 {count} 轮对话？',
+      turnsDeleted: '已提交删除 {count} 轮对话。',
+      inProgressNote: '进行中，下一回合生效',
+      noUserMessage: '（无用户提问）',
+      turnMeta: '{count} 条',
+      expandSection: '展开',
+      collapseSection: '折叠',
     }
 
     const en = {
@@ -112,6 +123,17 @@ window.__ModuleLoader__.load({
       deletedRecord: 'Deleted record #{seq}',
       selected: '{count} selected',
       unavailable: 'Not restorable',
+      confirmTotal: '{count} messages will be removed in total',
+      turnsSection: 'Turns (delete whole turn)',
+      turnBadge: 'Turn {turn}',
+      deleteTurn: 'Delete turn',
+      confirmBatchTurns: 'Delete the {count} selected turns?',
+      turnsDeleted: 'Queued {count} turn(s) for deletion.',
+      inProgressNote: 'in progress, applies next turn',
+      noUserMessage: '(no user prompt)',
+      turnMeta: '{count} messages',
+      expandSection: 'Expand',
+      collapseSection: 'Collapse',
     }
 
     const CSS = `
@@ -162,6 +184,11 @@ window.__ModuleLoader__.load({
 .dshmm-sectionTitle{font-size:12px;line-height:18px;font-weight:600;color:var(--dsw-alias-label-primary);white-space:nowrap}
 .dshmm-sectionCount{font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary);font-variant-numeric:tabular-nums}
 .dshmm-sectionActions{display:flex;align-items:center;gap:6px;margin-left:auto;min-width:0}
+.dshmm-sectionToggle{display:inline-flex;align-items:center;gap:6px;border:0;background:transparent;padding:0;margin:0;font:inherit;color:inherit;cursor:pointer}
+.dshmm-sectionToggle:hover{color:var(--dsw-alias-label-primary)}
+.dshmm-sectionToggle:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}
+.dshmm-chevron{font-size:10px;line-height:16px;color:var(--dsw-alias-label-secondary);width:10px;text-align:center}
+.dshmm-sectionToggle:hover .dshmm-chevron{color:var(--dsw-alias-label-primary)}
 .dshmm-selectAll{display:inline-flex;align-items:center;gap:6px;font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary);cursor:pointer;white-space:nowrap}
 .dshmm-check{width:14px;height:14px;margin:0;accent-color:var(--dsw-alias-brand-primary);cursor:pointer;flex:none}
 .dshmm-check:disabled{cursor:default;opacity:.45}
@@ -392,6 +419,8 @@ window.__ModuleLoader__.load({
           messageId: typeof message.id === 'string' ? message.id : undefined,
           preview: previewOf(message),
           blocks: content.length,
+          callIds: toolCallIdsOf(event),
+          toolCallId: event.type === 'tool/result' && typeof message.toolCallId === 'string' ? message.toolCallId : undefined,
         })
       }
 
@@ -460,6 +489,41 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /**
+     * Expand one selection the way the Host deletion planner will: deleting an
+     * assistant message takes its tool results along, and deleting a tool result
+     * takes the owning assistant message and its sibling results along.
+     * @returns the full set of seqs the Host would remove.
+     */
+    function expansionFor(items, selectedSeqs) {
+      const bySeq = new Map(items.map((item) => [item.seq, item]))
+      const chosen = new Set(selectedSeqs)
+      const takeGroup = (assistant) => {
+        chosen.add(assistant.seq)
+        for (const sibling of items) {
+          if (sibling.role === 'tool' && sibling.toolCallId !== undefined
+            && assistant.callIds !== undefined && assistant.callIds.includes(sibling.toolCallId)) {
+            chosen.add(sibling.seq)
+          }
+        }
+      }
+      for (const seq of selectedSeqs) {
+        const item = bySeq.get(seq)
+        if (item === undefined) continue
+        if (item.role === 'tool' && item.toolCallId !== undefined) {
+          for (const candidate of items) {
+            if (candidate.role === 'assistant' && candidate.callIds !== undefined
+              && candidate.callIds.includes(item.toolCallId)) {
+              takeGroup(candidate)
+            }
+          }
+        } else if (item.role === 'assistant' && item.callIds !== undefined && item.callIds.length > 0) {
+          takeGroup(item)
+        }
+      }
+      return chosen
+    }
+
     function MessageManagerButton({ sessionId, manager, t }) {
       const state = useManagerState(manager)
       const translate = typeof t === 'function' ? t : manager.translate
@@ -492,11 +556,14 @@ window.__ModuleLoader__.load({
       const deleted = folded.deleted
       const [selectedItems, setSelectedItems] = useState(() => new Set())
       const [selectedDeleted, setSelectedDeleted] = useState(() => new Set())
+      const [selectedTurnSet, setSelectedTurnSet] = useState(() => new Set())
       const [pending, setPending] = useState(undefined)
       const [status, setStatus] = useState(undefined)
       const [busy, setBusy] = useState(false)
       const listRef = useRef(null)
       const panelRef = useRef(null)
+      // The per-message list is secondary to the turns view; start collapsed.
+      const [currentCollapsed, setCurrentCollapsed] = useState(true)
 
       useEffect(() => {
         const panel = panelRef.current
@@ -524,6 +591,23 @@ window.__ModuleLoader__.load({
       const allCurrentSelected = items.length > 0 && currentSelectedSeqs.length === items.length
       const allDeletedSelected = restorableDeleted.length > 0 && deletedSelectedSeqs.length === restorableDeleted.length
 
+      // Conversation turns, oldest first; the newest turn with content is the
+      // one still in progress, so deleting it is applied on the next turn.
+      const turnGroups = useMemo(() => {
+        const byTurn = new Map()
+        for (const item of items) {
+          const group = byTurn.get(item.turn) ?? { turn: item.turn, items: [] }
+          group.items.push(item)
+          byTurn.set(item.turn, group)
+        }
+        return [...byTurn.values()].sort((a, b) => a.turn - b.turn)
+      }, [items])
+      const lastTurn = turnGroups.length > 0 ? turnGroups[turnGroups.length - 1].turn : undefined
+      const selectedTurns = turnGroups
+        .filter((group) => selectedTurnSet.has(group.turn))
+        .map((group) => group.turn)
+      const allTurnsSelected = turnGroups.length > 0 && selectedTurns.length === turnGroups.length
+
       const toggleCurrent = (seq, checked) => {
         setSelectedItems((current) => {
           const next = new Set(current)
@@ -531,6 +615,17 @@ window.__ModuleLoader__.load({
           else next.delete(seq)
           return next
         })
+      }
+      const toggleTurn = (turn, checked) => {
+        setSelectedTurnSet((current) => {
+          const next = new Set(current)
+          if (checked) next.add(turn)
+          else next.delete(turn)
+          return next
+        })
+      }
+      const toggleAllTurns = () => {
+        setSelectedTurnSet(allTurnsSelected ? new Set() : new Set(turnGroups.map((group) => group.turn)))
       }
       const toggleDeleted = (tombstoneSeq, checked) => {
         setSelectedDeleted((current) => {
@@ -561,10 +656,13 @@ window.__ModuleLoader__.load({
           }
           const fallback = kind === 'restore'
             ? t('restoreQueued', { count: seqs.length })
-            : t('deleted', { count: seqs.length })
+            : kind === 'deleteturn'
+              ? t('turnsDeleted', { count: seqs.length })
+              : t('deleted', { count: seqs.length })
           const text = result !== undefined && result !== null && result.kind === 'success' ? result.text : undefined
           setStatus({ kind: 'success', text: text || fallback })
           if (kind === 'delete') setSelectedItems(new Set())
+          else if (kind === 'deleteturn') setSelectedTurnSet(new Set())
           else setSelectedDeleted(new Set())
         } catch (error) {
           setStatus({ kind: 'error', text: error instanceof Error ? error.message : String(error) })
@@ -575,8 +673,7 @@ window.__ModuleLoader__.load({
 
       const confirmPending = () => {
         if (pending === undefined) return
-        const seqs = pending.seqs
-        run('delete', seqs)
+        run(pending.kind === 'turns' ? 'deleteturn' : 'delete', pending.seqs)
       }
 
       const renderCurrent = (item) => h(
@@ -624,7 +721,7 @@ window.__ModuleLoader__.load({
               'aria-label': t('delete'),
               disabled: busy,
               onClick: () => {
-                setPending({ seqs: [item.seq] })
+                setPending({ kind: 'msgs', seqs: [item.seq], total: expansionFor(items, [item.seq]).size })
                 setStatus(undefined)
               },
             },
@@ -632,6 +729,63 @@ window.__ModuleLoader__.load({
           ),
         ),
       )
+
+      const renderTurn = (group) => {
+        const own = group.items.find((item) => item.role === 'user')
+        const preview = (own ?? group.items[0])?.preview ?? ''
+        const inProgress = group.turn === lastTurn
+        return h(
+          'div',
+          { className: 'dshmm-row', key: `turn-${group.turn}`, 'data-role': 'user' },
+          h(
+            'label',
+            { className: 'dshmm-checkWrap' },
+            h('input', {
+              type: 'checkbox',
+              className: 'dshmm-check',
+              checked: selectedTurnSet.has(group.turn),
+              disabled: busy,
+              'aria-label': `Select turn ${group.turn}`,
+              onChange: (event) => toggleTurn(group.turn, event.target.checked),
+            }),
+          ),
+          h('span', { className: 'dshmm-role' }, t('turnBadge', { turn: group.turn })),
+          h(
+            'div',
+            { className: 'dshmm-main' },
+            h(
+              'div',
+              { className: 'dshmm-preview', title: preview || undefined },
+              preview || t('noUserMessage'),
+            ),
+            h(
+              'div',
+              { className: 'dshmm-meta' },
+              t('turnMeta', { count: group.items.length }),
+              inProgress ? ` · ${t('inProgressNote')}` : '',
+            ),
+          ),
+          h(
+            'div',
+            { className: 'dshmm-actions' },
+            h(
+              'button',
+              {
+                type: 'button',
+                className: 'dshmm-iconbtn',
+                title: t('deleteTurn'),
+                'aria-label': t('deleteTurn'),
+                disabled: busy,
+                onClick: () => {
+                  setPending({ kind: 'turns', seqs: [group.turn] })
+                  setStatus(undefined)
+                },
+              },
+              h(IconTrash),
+            ),
+          ),
+        )
+      }
 
       const renderDeleted = (group) => {
         const first = group.items[0]
@@ -699,7 +853,7 @@ window.__ModuleLoader__.load({
         )
       }
 
-      const sectionHeader = (title, count, allSelected, onToggleAll, actions, selectable) => h(
+      const sectionHeader = (title, count, allSelected, onToggleAll, actions, selectable, collapse) => h(
         'div',
         { className: 'dshmm-section' },
         selectable
@@ -716,7 +870,21 @@ window.__ModuleLoader__.load({
             allSelected ? t('clearSelection') : t('selectAll'),
           )
           : null,
-        h('span', { className: 'dshmm-sectionTitle' }, title),
+        collapse === undefined
+          ? h('span', { className: 'dshmm-sectionTitle' }, title)
+          : h(
+            'button',
+            {
+              type: 'button',
+              className: 'dshmm-sectionToggle',
+              title: collapse.collapsed ? t('expandSection') : t('collapseSection'),
+              'aria-label': collapse.collapsed ? t('expandSection') : t('collapseSection'),
+              'aria-expanded': collapse.collapsed ? 'false' : 'true',
+              onClick: collapse.onToggle,
+            },
+            h('span', { className: 'dshmm-chevron' }, collapse.collapsed ? '▸' : '▾'),
+            h('span', { className: 'dshmm-sectionTitle' }, title),
+          ),
         h('span', { className: 'dshmm-sectionCount' }, String(count)),
         h('div', { className: 'dshmm-sectionActions' }, actions),
       )
@@ -773,7 +941,15 @@ window.__ModuleLoader__.load({
             : h(
               'div',
               { className: 'dshmm-confirmBar' },
-              h('span', null, t('confirmBatch', { count: pending.seqs.length })),
+              h('span', null,
+                pending.kind === 'turns'
+                  ? t('confirmBatchTurns', { count: pending.seqs.length })
+                  : t('confirmBatch', { count: pending.seqs.length }),
+                pending.kind !== 'turns' && pending.total > pending.seqs.length
+                  ? h('span', { className: 'dshmm-subtle' },
+                    ` · ${t('confirmTotal', { count: pending.total })} · ${t('groupHint')}`)
+                  : null,
+              ),
               h(
                 'div',
                 { className: 'dshmm-confirmActions' },
@@ -810,6 +986,31 @@ window.__ModuleLoader__.load({
                 : h(
                   React.Fragment,
                   null,
+                  turnGroups.length === 0
+                    ? null
+                    : h(
+                      React.Fragment,
+                      null,
+                      sectionHeader(
+                        t('turnsSection'),
+                        turnGroups.length,
+                        allTurnsSelected,
+                        toggleAllTurns,
+                        h(
+                          'button',
+                          {
+                            type: 'button',
+                            className: 'dshmm-small',
+                            'data-danger': 'true',
+                            disabled: busy || selectedTurns.length === 0,
+                            onClick: () => setPending({ kind: 'turns', seqs: selectedTurns }),
+                          },
+                          t('deleteSelected', { count: selectedTurns.length }),
+                        ),
+                        true,
+                      ),
+                      turnGroups.map(renderTurn),
+                    ),
                   sectionHeader(
                     t('currentSection'),
                     items.length,
@@ -822,15 +1023,22 @@ window.__ModuleLoader__.load({
                         className: 'dshmm-small',
                         'data-danger': 'true',
                         disabled: busy || currentSelectedSeqs.length === 0,
-                        onClick: () => setPending({ seqs: currentSelectedSeqs }),
+                        onClick: () => setPending({
+                          kind: 'msgs',
+                          seqs: currentSelectedSeqs,
+                          total: expansionFor(items, currentSelectedSeqs).size,
+                        }),
                       },
                       t('deleteSelected', { count: currentSelectedSeqs.length }),
                     ),
                     true,
+                    { collapsed: currentCollapsed, onToggle: () => setCurrentCollapsed((value) => !value) },
                   ),
                   items.length === 0
                     ? h('div', { className: 'dshmm-empty' }, t('empty'))
-                    : items.map(renderCurrent),
+                    : currentCollapsed
+                      ? null
+                      : items.map(renderCurrent),
                   deleted.length === 0
                     ? null
                     : h(

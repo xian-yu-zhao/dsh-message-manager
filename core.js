@@ -51,6 +51,13 @@ export function toolCallIdsOf(event) {
   return ids
 }
 
+/** Whether one message event carries a tool-addition/removal block. */
+export function hasToolChange(event) {
+  const content = event?.data?.message?.content
+  return Array.isArray(content)
+    && content.some((block) => block?.type === 'tool-addition' || block?.type === 'tool-removal')
+}
+
 /** Collapse one message's content blocks into a one-line preview. */
 export function previewOf(message, limit = 160) {
   const content = Array.isArray(message?.content) ? message.content : []
@@ -273,20 +280,181 @@ export function tombstoneData(turn, step, id) {
   }
 }
 
-/** Human-readable Host listing for a command or tool result. */
-export function formatList(items, limit = 30) {
-  if (items.length === 0) return '当前模型上下文中没有可管理的消息。'
-  const shown = items.length > limit ? items.slice(-limit) : items
-  const omitted = items.length - shown.length
-  const lines = [
-    `当前模型上下文中共 ${items.length} 条可管理消息${omitted > 0 ? `，仅显示最近 ${shown.length} 条` : ''}：`,
-  ]
-  for (const item of shown) {
-    lines.push(`#${item.seq} [${item.role}] ${item.preview.length > 0 ? item.preview : '（空消息）'}`)
+/** Parse a `restored-assistant-<tombstoneSeq>-…` marker id back to its tombstone seq. */
+export function parseRestoredTombstoneId(id) {
+  if (typeof id !== 'string' || !id.startsWith('restored-assistant-')) return undefined
+  const rest = id.slice('restored-assistant-'.length)
+  const dash = rest.indexOf('-')
+  if (dash <= 0) return undefined
+  const seq = Number(rest.slice(0, dash))
+  return Number.isSafeInteger(seq) ? seq : undefined
+}
+
+/**
+ * Classify the deleted records currently reachable from the surface.
+ *
+ * Mirrors the restore planner's capability boundaries without throwing: a
+ * record is restorable when the same content would pass {@code planRestore}.
+ * @param events - current surface events, oldest first (tombstones included).
+ * @param bySeq - full-log index used to recover replaced originals.
+ * @returns deleted-record descriptors in surface order.
+ */
+export function deletedFromSurface(events, bySeq) {
+  const restored = new Set()
+  for (const event of events) {
+    if (event === undefined || event === null || event.type !== 'assistant/message') continue
+    const seq = parseRestoredTombstoneId(event.data?.message?.id)
+    if (seq !== undefined) restored.add(seq)
   }
-  if (omitted > 0) lines.push(`（更早的 ${omitted} 条请在标题栏的“消息管理”中查看。）`)
+  const records = []
+  for (const event of events) {
+    if (event === undefined || event === null || event.type !== 'developer/message') continue
+    if (event.data?.message?.source?.kind !== 'message-manager') continue
+    const op = event.surfaceOp
+    if (op === null || typeof op !== 'object' || op.op !== 'replace') continue
+    if (restored.has(event.seq)) continue
+    const targets = Array.isArray(event.sourceEventSeqs) ? event.sourceEventSeqs : []
+    const originals = targets.map((seq) => bySeq.get(seq))
+    const known = originals.filter((original) => original !== undefined)
+    const missing = targets.length - known.length
+    const assistant = known.find((original) => original.type === 'assistant/message')
+    const calls = assistant === undefined ? [] : toolCallIdsOf(assistant)
+    const results = known.filter((original) => original.type === 'tool/result')
+    let restorable = false
+    let reason = ''
+    if (targets.length === 1) {
+      const original = known[0]
+      if (original === undefined) restorable = true
+      else if (original.type === 'user/message') restorable = true
+      else if (original.type === 'developer/message' && !hasToolChange(original)) restorable = true
+      else if (original.type === 'assistant/message' && calls.length === 0) {
+        restorable = original.data?.message?.content?.length > 0
+        reason = 'appended'
+      } else if (original.type === 'tool/result') reason = 'tool'
+      else reason = 'group'
+    } else if (assistant !== undefined && calls.length > 0 && missing === 0
+      && results.length === targets.length - 1) {
+      const callIds = new Set(calls)
+      const resultIds = new Set(results.map((original) => original.data?.message?.toolCallId))
+      restorable = callIds.size === resultIds.size && [...callIds].every((id) => resultIds.has(id))
+      reason = restorable ? 'appended' : 'group'
+    } else {
+      reason = missing > 0 ? 'missing' : 'group'
+    }
+    records.push({
+      tombstoneSeq: event.seq,
+      targetSeqs: [...targets],
+      count: targets.length,
+      items: known.map((original) => ({
+        seq: original.seq,
+        role: roleOf(original),
+        preview: previewOf(original.type === 'user/message' ? original.data : original.data?.message),
+      })),
+      restorable,
+      reason,
+    })
+  }
+  return records
+}
+
+/** Human-readable Host listing for a command or tool result. */
+export function formatList(items, deleted = [], pending = [], limit = 30) {
+  const lines = []
+  if (items.length === 0) {
+    lines.push('当前模型上下文中没有可管理的消息。')
+  } else {
+    const shown = items.length > limit ? items.slice(-limit) : items
+    const omitted = items.length - shown.length
+    lines.push(`当前模型上下文中共 ${items.length} 条可管理消息${omitted > 0 ? `，仅显示最近 ${shown.length} 条` : ''}：`)
+    for (const item of shown) {
+      lines.push(`#${item.seq} [${item.role}] ${item.preview.length > 0 ? item.preview : '（空消息）'}`)
+    }
+    if (omitted > 0) lines.push(`（更早的 ${omitted} 条请在标题栏的“消息管理”中查看。）`)
+  }
+  if (pending.length > 0) {
+    lines.push('', `排队中（下一回合生效，共 ${pending.length} 项）：`)
+    for (const entry of pending) {
+      lines.push(`#${entry.recordSeq} ${entry.op} #${entry.targetSeq}`)
+    }
+  }
+  if (deleted.length > 0) {
+    lines.push('', `已删除 ${deleted.length} 条记录（restore 使用 #后的删除记录序号）：`)
+    for (const record of deleted.slice(-20)) {
+      const first = record.items[0]
+      const summary = record.items.length === 1 && first !== undefined
+        ? `${first.role} · ${first.preview.length > 0 ? first.preview : '（空消息）'}`
+        : `删除组 · ${record.count} 条`
+      const note = record.restorable
+        ? record.reason === 'appended' ? '恢复到末尾' : '恢复到原位置'
+        : '不可恢复'
+      lines.push(`#${record.tombstoneSeq} ← ${summary}（${note}）`)
+    }
+  }
   lines.push('', '删除：/msgmgr delete <序号,...>')
-  lines.push('恢复：/msgmgr restore <删除记录序号,...>（删除记录序号在标题栏的消息管理弹窗中查看）')
+  lines.push('整轮：/msgmgr deleteturn <轮号,...>（list-turns 查看轮号）')
+  lines.push('恢复：/msgmgr restore <删除记录序号,...>（也可在标题栏的消息管理弹窗中操作）')
   lines.push('删除只会从后续模型请求的上下文中移除该消息，原始会话日志与聊天记录仍会保留。')
+  return lines.join('\n')
+}
+
+/** Whether one event is an empty message-manager tombstone. */
+export function isTombstone(event) {
+  return event !== undefined
+    && event !== null
+    && event.type === 'developer/message'
+    && Array.isArray(event.data?.message?.content)
+    && event.data.message.content.length === 0
+    && event.data?.message?.source?.kind === 'message-manager'
+    && event.surfaceOp !== null
+    && typeof event.surfaceOp === 'object'
+    && event.surfaceOp.op === 'replace'
+}
+
+/**
+ * Group the surface's content nodes into conversation turns, oldest first.
+ *
+ * A node's turn comes from its own `data.turn`; a tombstone is invisible here
+ * (it derives no message), so a fully deleted turn disappears from the list.
+ * Injected context (runtime snapshots and reminders) carries the turn it was
+ * injected under and therefore joins that turn.
+ * @param events - current surface events, oldest first.
+ * @param bySeq - full-log index, kept for signature symmetry with the other
+ *   surface projections.
+ * @returns turn descriptors: { turn, seqs, messages, preview }.
+ */
+export function turnsFromSurface(events, bySeq = new Map()) {
+  const groups = new Map()
+  for (const event of events) {
+    if (event === undefined || event === null) continue
+    if (!visibleSurfaceEvent(event)) continue
+    const turn = Number.isSafeInteger(event.data?.turn) ? event.data.turn : undefined
+    if (!Number.isSafeInteger(turn)) continue
+    const message = messageOf(event)
+    const role = roleOf(event)
+    const preview = previewOf(message)
+    const group = groups.get(turn) ?? { turn, seqs: [], messages: [] }
+    group.seqs.push(event.seq)
+    group.messages.push({ seq: event.seq, role, preview })
+    groups.set(turn, group)
+  }
+  for (const group of groups.values()) {
+    const own = group.messages.find((entry) => entry.role === 'user')
+    group.preview = (own ?? group.messages[0])?.preview ?? ''
+  }
+  return [...groups.values()].sort((a, b) => a.turn - b.turn)
+}
+
+/** Human-readable turn listing for a command or tool result. */
+export function formatTurns(turns, limit = 50) {
+  if (turns.length === 0) return '当前上下文中没有可删除的对话轮。'
+  const shown = turns.length > limit ? turns.slice(-limit) : turns
+  const omitted = turns.length - shown.length
+  const lines = [`当前上下文中共 ${turns.length} 轮对话${omitted > 0 ? `，仅显示最近 ${shown.length} 轮` : ''}：`]
+  for (const turn of shown) {
+    const mark = turn.inProgress ? '（进行中，删除将在下一回合生效）' : ''
+    lines.push(`T${turn.turn} · ${turn.preview.length > 0 ? turn.preview : '（无用户提问）'} · ${turn.messages.length} 条${mark}`)
+  }
+  lines.push('', '删除整轮：/msgmgr deleteturn <轮号,...>')
+  lines.push('整轮删除会一并移除该轮的上下文注入；恢复仍按单条删除记录粒度进行。')
   return lines.join('\n')
 }

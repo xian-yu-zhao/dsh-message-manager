@@ -8,10 +8,15 @@
  *
  * Session format validation requires every `developer/message` to match an open
  * turn and step, and a Session cannot append from inside its own `session/event`
- * dispatch. A deletion or restore that cannot run safely right now is queued on
- * the owning Agent's `agent/request` waterfall: that hook runs after
- * `step/start` (so the step is open and appending is allowed) and before the
- * request messages are derived, so the next request already reflects it.
+ * dispatch. A deletion or restore that cannot run safely right now is therefore
+ * recorded as a durable `plugin:message-manager/pending` record — plugin records
+ * append without an open turn/step and travel with the log across restarts —
+ * and replayed on the owning Agent's `agent/request` waterfall. That hook runs
+ * after `step/start` (so the step is open and appending is allowed) and before
+ * the request messages are derived, so the next request already reflects it.
+ * Every replay is idempotent: an applied record is acknowledged with a
+ * `plugin:message-manager/ack` record, and a replayed operation whose target
+ * vanished is acknowledged as skipped instead of being retried forever.
  *
  * Restore reverses a tombstone:
  * - user/context: the tombstone is replaced by a copy of the original message,
@@ -22,13 +27,42 @@
  *   results are appended as one valid lifecycle at the tail.
  */
 import { randomUUID } from 'node:crypto'
+import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import {
+  deletedFromSurface,
   foldSurface,
   formatList,
+  formatTurns,
+  hasToolChange,
   itemsFromSurface,
   planDeletion,
   tombstoneData,
+  turnsFromSurface,
 } from './core.js'
+
+/**
+ * Load the Session core the Host itself runs on.
+ *
+ * A profile-linked plugin cannot resolve `@deepseek-ai/*` by bare name: its
+ * realpath sits outside the profile, and the packaged desktop carries the core
+ * packages only inside the application asar. Try the bare specifier first (dev
+ * checkouts with a real node_modules), then anchor on the Host process's
+ * runtime directory — the packaged desktop Host starts with that directory as
+ * `process.argv[2]`, and importing the same file URL yields the same module
+ * instance the Host itself uses, so Session private-field brand checks pass.
+ */
+let sessionCore
+try {
+  sessionCore = await import('@deepseek-ai/dsh-session')
+} catch {
+  const runtimeDir = process.argv[2]
+  if (typeof runtimeDir !== 'string' || runtimeDir.length === 0) {
+    throw new Error('message-manager 无法加载 @deepseek-ai/dsh-session：裸导入失败，且当前进程不是携带运行时目录的桌面 Host。')
+  }
+  sessionCore = await import(pathToFileURL(join(runtimeDir, 'node_modules', '@deepseek-ai', 'dsh-session', 'lib', 'index.js')).href)
+}
+const { appendPluginRecord, pluginRecordOf } = sessionCore
 
 export const name = 'message-manager'
 
@@ -36,6 +70,10 @@ export const inject = ['sessions', 'agents', 'commands', 'tools']
 
 const TOMBSTONE_SOURCE = 'message-manager'
 const RESTORED_PREFIX = 'restored-assistant-'
+const PENDING_TYPE = 'plugin:message-manager/pending'
+const ACK_TYPE = 'plugin:message-manager/ack'
+/** Messages that mean a replayed operation already happened; ack as skipped. */
+const IDEMPOTENT_MARKERS = ['已不在当前表面', '已经恢复', '已不在会话日志']
 
 /** Resolve the live Session behind one command/tool agent. */
 function liveSession(ctx, agent) {
@@ -67,13 +105,27 @@ function surfaceEventsSync(session) {
 
 /**
  * Read the turn/step that is open at the very end of the live log.
+ * Scans backward: the last boundary marker decides the state, so an open step
+ * deep in a long session is found without walking the whole log.
  * @returns the open coordinates plus the opening step seq, or undefined.
  */
 function openStepOf(session) {
+  const events = session.snapshotEvents()
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]
+    if (event.type === 'turn/end' || event.type === 'step/end' || event.type === 'turn/start') return undefined
+    if (event.type === 'step/start') {
+      const { turn, step } = event.data ?? {}
+      if (Number.isSafeInteger(turn) && Number.isSafeInteger(step) && turn >= 0 && step >= 0) {
+        return { turn, step, startSeq: event.seq }
+      }
+      break // unusual payload; fall back to the full forward scan
+    }
+  }
   let turn = null
   let step = null
   let startSeq
-  for (const event of session.snapshotEvents()) {
+  for (const event of events) {
     switch (event.type) {
       case 'turn/start':
         turn = event.data.turn
@@ -149,11 +201,55 @@ function assistantToolCalls(event) {
     : []
 }
 
-/** Whether one developer message carries a tool-addition/removal block. */
-function hasToolChange(event) {
-  const content = event?.data?.message?.content
-  return Array.isArray(content)
-    && content.some((block) => block?.type === 'tool-addition' || block?.type === 'tool-removal')
+/** Per-plugin-instance incremental scan state, keyed by plugin ctx then session id. */
+const queueCaches = new WeakMap()
+
+/**
+ * Unacknowledged pending operations in log order, incrementally.
+ *
+ * The queue lives in the session log as plugin records, so a restart replays it
+ * for free; within one process each event is examined exactly once.
+ * @returns durable queue entries: { recordSeq, op, targetSeq }.
+ */
+function durableQueue(ctx, session) {
+  let cache = queueCaches.get(ctx)
+  if (cache === undefined) {
+    cache = new Map()
+    queueCaches.set(ctx, cache)
+  }
+  const state = cache.get(session.id) ?? { checkedTo: -1, pending: new Map() }
+  const events = session.snapshotEvents(Math.max(0, state.checkedTo + 1))
+  for (const event of events) {
+    const record = pluginRecordOf(event)
+    if (record === undefined) continue
+    if (record.type === ACK_TYPE) {
+      const pendingSeq = record.data?.pendingSeq
+      if (Number.isSafeInteger(pendingSeq)) state.pending.delete(pendingSeq)
+    } else if (record.type === PENDING_TYPE) {
+      const op = record.data?.op
+      const targetSeq = record.data?.targetSeq
+      if ((op === 'delete' || op === 'restore' || op === 'delete-turn') && Number.isSafeInteger(targetSeq)) {
+        state.pending.set(record.seq, { recordSeq: record.seq, op, targetSeq })
+      }
+    }
+  }
+  if (events.length > 0) state.checkedTo = events[events.length - 1].seq
+  cache.set(session.id, state)
+  return [...state.pending.values()]
+}
+
+/** Durably enqueue one operation; plugin records need no open turn/step. */
+function appendPending(session, op, targetSeq) {
+  return appendPluginRecord(session, PENDING_TYPE, { op, targetSeq })
+}
+
+/** Acknowledge one pending record so restarts and replays leave it alone. */
+function appendAck(session, pendingSeq, result, detail) {
+  appendPluginRecord(session, ACK_TYPE, {
+    pendingSeq,
+    result,
+    ...typeof detail === 'string' && detail.length > 0 ? { detail: detail.slice(0, 300) } : {},
+  })
 }
 
 /**
@@ -302,16 +398,19 @@ function restoreOne(session, tombstoneSeq, turn, step) {
   throw new Error('不支持恢复该删除记录。')
 }
 
-/** List current surface messages as text. */
+/** List current surface messages plus deleted records and durable queue. */
 async function listMessages(ctx, agent) {
   const session = liveSession(ctx, agent)
   const events = await readSurfaceEvents(ctx, session)
   const items = itemsFromSurface(events)
-  return { text: formatList(items), items }
+  const bySeq = new Map(session.snapshotEvents().map((event) => [event.seq, event]))
+  const deleted = deletedFromSurface(events, bySeq)
+  const pending = durableQueue(ctx, session)
+  return { text: formatList(items, deleted, pending), items, deleted, pending }
 }
 
-/** Delete one or more messages now when safe, otherwise queue them. */
-async function deleteMessages(ctx, agent, seqs, runtime) {
+/** Delete one or more messages now when safe, otherwise queue them durably. */
+async function deleteMessages(ctx, agent, seqs) {
   const unique = [...new Set(seqs)]
   if (unique.length === 0 || unique.some((seq) => !Number.isSafeInteger(seq) || seq < 0)) {
     throw new Error('序号必须是非负整数。')
@@ -354,15 +453,17 @@ async function deleteMessages(ctx, agent, seqs, runtime) {
     }
   }
 
-  const queue = runtime.pendingBySession.get(session.id) ?? []
+  const queuedTargets = new Set(durableQueue(ctx, session)
+    .filter((entry) => entry.op === 'delete')
+    .map((entry) => entry.targetSeq))
   let added = 0
   for (const target of targets) {
-    if (queue.some((entry) => entry.kind === 'delete' && entry.targetSeq === target.seq)) continue
-    queue.push({ kind: 'delete', targetSeq: target.seq })
+    if (queuedTargets.has(target.seq)) continue
+    appendPending(session, 'delete', target.seq)
+    queuedTargets.add(target.seq)
     added += 1
   }
-  runtime.pendingBySession.set(session.id, queue)
-  if (!runtime.ensureAgentListener(agent)) {
+  if (!ensureAgentListener(ctx, agent)) {
     throw new Error('当前会话没有可用的 Agent 请求作用域，无法排队删除；请重试。')
   }
   return {
@@ -375,7 +476,7 @@ async function deleteMessages(ctx, agent, seqs, runtime) {
 }
 
 /** Queue one or more tombstones for restore at the next request. */
-async function restoreMessages(ctx, agent, tombstoneSeqs, runtime) {
+async function restoreMessages(ctx, agent, tombstoneSeqs) {
   const unique = [...new Set(tombstoneSeqs)]
   if (unique.length === 0 || unique.some((seq) => !Number.isSafeInteger(seq) || seq < 0)) {
     throw new Error('删除记录序号必须是非负整数。')
@@ -395,15 +496,17 @@ async function restoreMessages(ctx, agent, tombstoneSeqs, runtime) {
     accepted.push(seq)
   }
   if (accepted.length === 0) throw new Error('没有可恢复的删除记录（可能已经恢复）。')
-  const queue = runtime.pendingBySession.get(session.id) ?? []
+  const queuedTargets = new Set(durableQueue(ctx, session)
+    .filter((entry) => entry.op === 'restore')
+    .map((entry) => entry.targetSeq))
   let added = 0
   for (const seq of accepted) {
-    if (queue.some((entry) => entry.kind === 'restore' && entry.targetSeq === seq)) continue
-    queue.push({ kind: 'restore', targetSeq: seq })
+    if (queuedTargets.has(seq)) continue
+    appendPending(session, 'restore', seq)
+    queuedTargets.add(seq)
     added += 1
   }
-  runtime.pendingBySession.set(session.id, queue)
-  if (!runtime.ensureAgentListener(agent)) {
+  if (!ensureAgentListener(ctx, agent)) {
     throw new Error('当前会话没有可用的 Agent 请求作用域，无法排队恢复；请重试。')
   }
   return {
@@ -415,6 +518,200 @@ async function restoreMessages(ctx, agent, tombstoneSeqs, runtime) {
   }
 }
 
+/** List current conversation turns as text. */
+async function listTurns(ctx, agent) {
+  const session = liveSession(ctx, agent)
+  const events = await readSurfaceEvents(ctx, session)
+  const bySeq = new Map(session.snapshotEvents().map((event) => [event.seq, event]))
+  const open = openStepOf(session)
+  const turns = turnsFromSurface(events, bySeq).map((turn) => ({
+    ...turn,
+    inProgress: open !== undefined && turn.seqs.some((seq) => seq >= open.startSeq),
+  }))
+  return { text: formatTurns(turns), turns }
+}
+
+/** Delete whole conversation turns now when safe, otherwise queue them durably. */
+async function deleteTurns(ctx, agent, turnNums) {
+  const unique = [...new Set(turnNums)]
+  if (unique.length === 0 || unique.some((num) => !Number.isSafeInteger(num) || num < 0)) {
+    throw new Error('轮号必须是非负整数（list-turns 查看）。')
+  }
+  const session = liveSession(ctx, agent)
+  const events = await readSurfaceEvents(ctx, session)
+  const bySeq = new Map(session.snapshotEvents().map((event) => [event.seq, event]))
+  const open = openStepOf(session)
+  const all = turnsFromSurface(events, bySeq)
+  const targets = []
+  for (const num of unique) {
+    const turn = all.find((entry) => entry.turn === num)
+    if (turn === undefined) {
+      if (unique.length === 1) throw new Error('该轮已不在当前上下文中（可能已删除）；list-turns 查看现有轮。')
+      continue
+    }
+    targets.push(turn)
+  }
+  if (targets.length === 0) throw new Error('选中的轮都已不在当前上下文中。')
+
+  const touchesOpen = open !== undefined
+    && targets.some((turn) => turn.seqs.some((seq) => seq >= open.startSeq))
+  if (open !== undefined && !touchesOpen) {
+    let turns = 0
+    let messages = 0
+    for (const turn of targets) {
+      const done = deleteTurnNow(session, turn.turn, open.turn, open.step)
+      if (done !== null) {
+        turns += 1
+        messages += done
+      }
+    }
+    return {
+      text: `已从模型上下文删除 ${turns} 轮对话（共 ${messages} 条消息；会话日志与聊天记录仍保留）。`,
+      turns,
+      messages,
+      queued: false,
+    }
+  }
+
+  const queued = new Set(durableQueue(ctx, session)
+    .filter((entry) => entry.op === 'delete-turn')
+    .map((entry) => entry.targetSeq))
+  let added = 0
+  for (const turn of targets) {
+    if (queued.has(turn.turn)) continue
+    appendPending(session, 'delete-turn', turn.turn)
+    queued.add(turn.turn)
+    added += 1
+  }
+  if (!ensureAgentListener(ctx, agent)) {
+    throw new Error('当前会话没有可用的 Agent 请求作用域，无法排队删除；请重试。')
+  }
+  return {
+    text: added === 0
+      ? '选中的轮已在删除队列中，将在下一回合开始时生效。'
+      : `已加入删除队列：${added} 轮对话将在下一回合开始时从模型上下文移除（会话日志与聊天记录仍保留）。`,
+    turns: added,
+    queued: true,
+  }
+}
+
+/**
+ * Delete every remaining content node of one conversation turn, grouping the
+ * nodes through the same planner used for single-message deletion so each
+ * tombstone keeps its own restore semantics (user in place, assistant groups
+ * and text at the tail). Tombstones already on the surface stay untouched.
+ * @returns the number of messages removed, or null when none remain.
+ */
+function deleteTurnNow(session, turnNum, curTurn, curStep) {
+  const bySeq = new Map(session.snapshotEvents().map((event) => [event.seq, event]))
+  const turn = turnsFromSurface(surfaceEventsSync(session), bySeq)
+    .find((entry) => entry.turn === turnNum)
+  if (turn === undefined || turn.seqs.length === 0) return null
+  const planned = new Set()
+  let count = 0
+  for (const seq of turn.seqs) {
+    if (planned.has(seq)) continue
+    // Re-plan against the live surface: an earlier group may already have
+    // absorbed this target, and each append invalidates stale ranges.
+    const current = surfaceEventsSync(session)
+    const plan = planDeletion(current, seq)
+    if (!plan.ok) continue
+    appendTombstones(session, plan.runs, curTurn, curStep)
+    for (const index of plan.indices) planned.add(current[index].seq)
+    count += plan.count
+  }
+  return count
+}
+
+/** Per-plugin-instance agent listener registries, keyed by plugin ctx. */
+const listenerRegistries = new WeakMap()
+
+/** The listener registry owned by one plugin ctx. */
+function listenerRegistry(ctx) {
+  let registry = listenerRegistries.get(ctx)
+  if (registry === undefined) {
+    registry = new Map()
+    listenerRegistries.set(ctx, registry)
+  }
+  return registry
+}
+
+/**
+ * Replay every durable pending delete/restore for one Agent's Session inside
+ * the request's open step, then acknowledge each record so it never replays
+ * again. Replayed operations whose target already vanished are acked as
+ * skipped; genuine failures are acked with the reason.
+ */
+function applyQueuedOperations(ctx, agent, turn, step) {
+  const session = ctx.sessions.get(agent.id)
+  if (session === undefined) return
+  const queue = durableQueue(ctx, session)
+  if (queue.length === 0) return
+  for (const entry of queue) {
+    try {
+      if (entry.op === 'delete') {
+        const plan = planDeletion(surfaceEventsSync(session), entry.targetSeq)
+        if (!plan.ok) {
+          appendAck(session, entry.recordSeq, 'skipped', `target #${entry.targetSeq} ${plan.reason}`)
+          continue
+        }
+        appendTombstones(session, plan.runs, turn, step)
+        appendAck(session, entry.recordSeq, 'applied')
+      } else if (entry.op === 'delete-turn') {
+        const done = deleteTurnNow(session, entry.targetSeq, turn, step)
+        if (done === null) {
+          appendAck(session, entry.recordSeq, 'skipped', `turn #${entry.targetSeq} has no remaining content`)
+        } else {
+          appendAck(session, entry.recordSeq, 'applied')
+        }
+      } else {
+        restoreOne(session, entry.targetSeq, turn, step)
+        appendAck(session, entry.recordSeq, 'applied')
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      const result = IDEMPOTENT_MARKERS.some((marker) => message.includes(marker)) ? 'skipped' : 'failed'
+      appendAck(session, entry.recordSeq, result, message)
+      if (result === 'failed') {
+        ctx.logger?.warn?.(`message-manager: queued ${entry.op} ${entry.targetSeq} failed: ${message}`)
+      }
+    }
+  }
+  // Refresh the incremental cache with the acks just appended.
+  durableQueue(ctx, session)
+}
+
+/**
+ * Register one Agent-scoped `agent/request` listener for queued operations.
+ * The request hook runs after `step/start` and before request derivation.
+ * @returns whether the listener is available.
+ */
+function ensureAgentListener(ctx, agent) {
+  if (agent === undefined || agent === null || typeof agent.id !== 'string') return false
+  const agentListeners = listenerRegistry(ctx)
+  const id = agent.id
+  if (agentListeners.has(id)) return true
+  const liveAgent = ctx.agents.get(id) ?? agent
+  const owner = liveAgent.ctx ?? agent.ctx
+  if (owner === undefined || owner === null || typeof owner.on !== 'function') return false
+  const stop = owner.on('agent/request', (payload, next) => {
+    if (payload === undefined || payload.agent === undefined || payload.agent.id !== id) return next()
+    applyQueuedOperations(ctx, liveAgent, payload.turn, payload.step)
+    return next()
+  })
+  const disposeOwnerEffect = typeof owner.effect === 'function'
+    ? owner.effect(() => () => {
+      stop()
+      agentListeners.delete(id)
+    }, 'message-manager: queued operations')
+    : () => {
+      stop()
+      agentListeners.delete(id)
+    }
+  agentListeners.set(id, { stop, disposeOwnerEffect })
+  return true
+}
+
 /** Parse `/msgmgr` input into an operation. */
 function parseCommand(rawInput) {
   const text = typeof rawInput === 'string' ? rawInput.trim() : ''
@@ -422,92 +719,31 @@ function parseCommand(rawInput) {
   const parts = text.split(/\s+/)
   const head = parts[0].toLowerCase()
   if (head === 'list' || head === 'ls') return { op: 'list' }
-  if (head === 'delete' || head === 'rm' || head === 'restore' || head === 'undo') {
+  if (head === 'turns' || head === 'list-turns' || head === 'ls-turns') return { op: 'list-turns' }
+  const deleteTurn = head === 'deleteturn' || head === 'delturn' || head === 'dt'
+  if (head === 'delete' || head === 'rm' || head === 'restore' || head === 'undo' || deleteTurn) {
     const rest = text.slice(head.length).trim()
     const values = rest.length === 0 ? [] : rest.split(/[,\s]+/).filter(Boolean)
-    if (values.length === 0) return { op: 'invalid', reason: '缺少要处理的序号。' }
-    if (values.some((value) => !/^\d+$/.test(value))) return { op: 'invalid', reason: '序号必须是数字，多个用逗号分隔。' }
-    return { op: head === 'restore' || head === 'undo' ? 'restore' : 'delete', seqs: values.map(Number) }
+    if (values.length === 0) return { op: 'invalid', reason: deleteTurn ? '缺少要删除的轮号。' : '缺少要处理的序号。' }
+    if (values.some((value) => !/^\d+$/.test(value))) return { op: 'invalid', reason: '轮号/序号必须是数字，多个用逗号分隔。' }
+    return {
+      op: deleteTurn ? 'delete-turns' : head === 'restore' || head === 'undo' ? 'restore' : 'delete',
+      seqs: values.map(Number),
+    }
   }
   return { op: 'invalid', reason: `未知子命令 “${parts[0]}”。` }
 }
 
 export function apply(ctx) {
-  const pendingBySession = new Map()
-  const agentListeners = new Map()
-
-  /** Apply every queued delete/restore for this Session inside the request's step. */
-  function applyQueuedOperations(agent, turn, step) {
-    const session = ctx.sessions.get(agent.id)
-    if (session === undefined) {
-      pendingBySession.delete(agent.id)
-      return
-    }
-    const queue = pendingBySession.get(session.id)
-    if (queue === undefined || queue.length === 0) return
-    pendingBySession.delete(session.id)
-    for (const entry of queue) {
-      try {
-        if (entry.kind === 'delete') {
-          const plan = planDeletion(surfaceEventsSync(session), entry.targetSeq)
-          if (!plan.ok) {
-            ctx.logger?.warn?.(`message-manager: queued deletion target ${entry.targetSeq} is no longer on the surface; skipped`)
-            continue
-          }
-          appendTombstones(session, plan.runs, turn, step)
-        } else {
-          restoreOne(session, entry.targetSeq, turn, step)
-        }
-      } catch (error) {
-        ctx.logger?.warn?.(`message-manager: queued ${entry.kind} ${entry.targetSeq} failed: ${String(error)}`)
-      }
-    }
-  }
-
-  /**
-   * Register one Agent-scoped `agent/request` listener for queued operations.
-   * The request hook runs after `step/start` and before request derivation.
-   * @returns whether the listener is available.
-   */
-  function ensureAgentListener(agent) {
-    if (agent === undefined || agent === null || typeof agent.id !== 'string') return false
-    const id = agent.id
-    if (agentListeners.has(id)) return true
-    const liveAgent = ctx.agents.get(id) ?? agent
-    const owner = liveAgent.ctx ?? agent.ctx
-    if (owner === undefined || owner === null || typeof owner.on !== 'function') return false
-    const stop = owner.on('agent/request', (payload, next) => {
-      if (payload === undefined || payload.agent === undefined || payload.agent.id !== id) return next()
-      const queue = pendingBySession.get(id)
-      if (queue !== undefined && queue.length > 0) applyQueuedOperations(liveAgent, payload.turn, payload.step)
-      return next()
-    })
-    const disposeOwnerEffect = typeof owner.effect === 'function'
-      ? owner.effect(() => () => {
-        stop()
-        pendingBySession.delete(id)
-        agentListeners.delete(id)
-      }, 'message-manager: queued operations')
-      : () => {
-        stop()
-        pendingBySession.delete(id)
-        agentListeners.delete(id)
-      }
-    agentListeners.set(id, { stop, disposeOwnerEffect })
-    return true
-  }
-
-  for (const liveAgent of ctx.agents.list()) ensureAgentListener(liveAgent)
+  for (const liveAgent of ctx.agents.list()) ensureAgentListener(ctx, liveAgent)
   const stopCreated = ctx.on('agent/created', (payload) => {
-    if (payload !== undefined) ensureAgentListener(payload.agent)
+    if (payload !== undefined) ensureAgentListener(ctx, payload.agent)
   })
-
-  const runtime = { pendingBySession, ensureAgentListener }
 
   const command = ctx.commands.register({
     name: 'msgmgr',
-    description: '列出、批量删除或恢复当前会话中的单条消息（仅移出/恢复模型上下文，保留原始日志）。',
-    input: { hint: 'list | delete <序号,...> | restore <删除记录序号,...>' },
+    description: '列出、批量删除或恢复当前会话中的单条消息，并按轮删除整轮对话（仅移出/恢复模型上下文，保留原始日志）。',
+    input: { hint: 'list | turns | delete <序号,...> | deleteturn <轮号,...> | restore <删除记录序号,...>' },
     recordInput: false,
     async handler(invocation) {
       try {
@@ -516,15 +752,23 @@ export function apply(ctx) {
           const result = await listMessages(ctx, invocation.agent)
           return { kind: 'success', text: result.text }
         }
+        if (parsed.op === 'list-turns') {
+          const result = await listTurns(ctx, invocation.agent)
+          return { kind: 'success', text: result.text }
+        }
         if (parsed.op === 'delete') {
-          const result = await deleteMessages(ctx, invocation.agent, parsed.seqs, runtime)
+          const result = await deleteMessages(ctx, invocation.agent, parsed.seqs)
+          return { kind: 'success', text: result.text }
+        }
+        if (parsed.op === 'delete-turns') {
+          const result = await deleteTurns(ctx, invocation.agent, parsed.seqs)
           return { kind: 'success', text: result.text }
         }
         if (parsed.op === 'restore') {
-          const result = await restoreMessages(ctx, invocation.agent, parsed.seqs, runtime)
+          const result = await restoreMessages(ctx, invocation.agent, parsed.seqs)
           return { kind: 'success', text: result.text }
         }
-        return { kind: 'error', text: `${parsed.reason} 用法：/msgmgr list | /msgmgr delete <序号,...> | /msgmgr restore <删除记录序号,...>` }
+        return { kind: 'error', text: `${parsed.reason} 用法：/msgmgr list | /msgmgr turns | /msgmgr delete <序号,...> | /msgmgr deleteturn <轮号,...> | /msgmgr restore <删除记录序号,...>` }
       } catch (error) {
         return { kind: 'error', text: error instanceof Error ? error.message : String(error) }
       }
@@ -533,14 +777,14 @@ export function apply(ctx) {
 
   const tool = ctx.tools.register({
     name: 'message_manager',
-    description: 'List, delete, or restore messages in the current session. Delete removes the selected messages, and any tool results tied to an assistant message that calls tools, from the model context of later requests; the raw session log and the chat transcript are retained. Restore re-introduces a previously deleted message or tool group (user/context restores at its original position; assistant content is appended at the tail). Operations that cannot run safely yet are queued and applied when the next step starts. Use only when the user explicitly asks. Requires a live session.',
+    description: 'Manage the model context of the current session. Actions: list (current messages plus deleted records and queued operations), list-turns (conversation turns with turn numbers), delete (message seqs; any tool results tied to an assistant message that calls tools go with it), delete-turns (whole turns: the user prompt, the assistant work and reply, and that turn\'s injected context), restore (tombstone seqs from list; user/context restores at its original position, assistant content is appended at the tail). Deletion only affects later model requests; the raw session log and chat transcript are retained. Operations that cannot run safely yet are recorded durably in the session log and applied when the next step starts, surviving restarts. Use only when the user explicitly asks. Requires a live session.',
     parameters: {
       type: 'object',
       properties: {
         action: {
           type: 'string',
-          enum: ['list', 'delete', 'restore'],
-          description: 'list current messages, delete message seqs, or restore tombstone seqs.',
+          enum: ['list', 'list-turns', 'delete', 'delete-turns', 'restore'],
+          description: 'list messages, list conversation turns, delete message seqs, delete whole turns by turn number, or restore tombstone seqs.',
         },
         seq: {
           type: 'integer',
@@ -549,7 +793,7 @@ export function apply(ctx) {
         seqs: {
           type: 'array',
           items: { type: 'integer' },
-          description: 'Message seqs for delete, or tombstone seqs for restore.',
+          description: 'Message seqs for delete, turn numbers for delete-turns, or tombstone seqs for restore (from list/turns output).',
         },
       },
       required: ['action'],
@@ -578,17 +822,26 @@ export function apply(ctx) {
         const result = await listMessages(ctx, exec.agent)
         return { ok: true, text: result.text }
       }
+      if (action === 'list-turns') {
+        const result = await listTurns(ctx, exec.agent)
+        return { ok: true, text: result.text }
+      }
       if (action === 'delete') {
         if (list.length === 0) throw new Error('delete 需要 list 返回的整数 seq 或 seqs。')
-        const result = await deleteMessages(ctx, exec.agent, list, runtime)
+        const result = await deleteMessages(ctx, exec.agent, list)
+        return { ok: true, text: result.text }
+      }
+      if (action === 'delete-turns') {
+        if (list.length === 0) throw new Error('delete-turns 需要 list-turns 返回的整数轮号。')
+        const result = await deleteTurns(ctx, exec.agent, list)
         return { ok: true, text: result.text }
       }
       if (action === 'restore') {
         if (list.length === 0) throw new Error('restore 需要已删除记录返回的整数 tombstone seq。')
-        const result = await restoreMessages(ctx, exec.agent, list, runtime)
+        const result = await restoreMessages(ctx, exec.agent, list)
         return { ok: true, text: result.text }
       }
-      throw new Error('action 必须是 list、delete 或 restore。')
+      throw new Error('action 必须是 list、list-turns、delete、delete-turns 或 restore。')
     },
   })
 
@@ -596,11 +849,11 @@ export function apply(ctx) {
     tool()
     command()
     stopCreated()
+    const agentListeners = listenerRegistry(ctx)
     for (const entry of [...agentListeners.values()]) {
       entry.stop()
       entry.disposeOwnerEffect()
     }
     agentListeners.clear()
-    pendingBySession.clear()
   }, 'message-manager: command, tool, and queued operations')
 }

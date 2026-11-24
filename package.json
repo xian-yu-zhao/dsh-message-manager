@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-message-manager",
-  "version": "1.2.0",
+  "version": "1.4.1",
   "private": true,
   "type": "module",
   "description": "Manage, batch-delete, and restore individual messages in a DSH session without deleting the raw session log.",
