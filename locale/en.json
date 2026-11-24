@@ -1,6 +1,7 @@
 {
   "meta": {
-    "title": "Session Message Manager",
-    "description": "Manage session messages from the header and delete individual messages while keeping the raw session log."
+    "title": "Session message manager",
+    "description": "Delete single messages or whole conversation turns from the model context of a DSH session, and restore them later. Open the list icon in the session header, or use /msgmgr and the message_manager tool. Deleting appends an empty developer message that replaces the range on the session surface, so the raw session log, the chat transcript and audit data stay intact and removed messages disappear only from later model requests. Turns are listed with numbers, previews and an in-progress marker. Operations that cannot append safely are written into the session log as plugin records and applied at the next request, so they survive restarts; restore puts user and context messages back at their original position and appends assistant content at the tail. Local only, nothing leaves the machine. Requires a running session; system prompts and messages that are still streaming cannot be deleted. Turning the plugin off removes the header entry, the command and the tool, while tombstones already written stay in the log.",
+    "detail": "docs/DETAIL.md"
   }
 }

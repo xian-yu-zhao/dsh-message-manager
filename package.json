@@ -1,17 +1,34 @@
 {
-  "name": "@local/dsh-message-manager",
-  "version": "1.4.1",
-  "private": true,
+  "name": "dsh-message-manager",
+  "version": "1.5.0",
   "type": "module",
-  "description": "Manage, batch-delete, and restore individual messages in a DSH session without deleting the raw session log.",
+  "description": "Delete single messages or whole conversation turns from a DSH session's model context, and restore them later, without touching the raw session log.",
   "license": "MIT",
+  "author": "xian-yu-zhao",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "cordis",
+    "plugin",
+    "session",
+    "message",
+    "context",
+    "tombstone",
+    "delete",
+    "restore"
+  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/xian-yu-zhao/dsh-message-manager.git"
   },
-  "homepage": "https://github.com/xian-yu-zhao/dsh-message-manager",
+  "homepage": "https://github.com/xian-yu-zhao/dsh-message-manager#readme",
   "bugs": {
     "url": "https://github.com/xian-yu-zhao/dsh-message-manager/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
   },
   "exports": {
     ".": "./index.js",
@@ -26,6 +43,7 @@
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg",
+    "docs",
     "README.md",
     "CHANGELOG.md",
     "LICENSE"

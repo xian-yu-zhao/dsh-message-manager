@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.5.0
+
+- Publishable package: renamed from `@local/dsh-message-manager` to `dsh-message-manager`, dropped `private`, added keywords, `author`, `publishConfig` (public, `registry.npmjs.org`), `homepage`/`bugs`, and a `files` whitelist that covers runtime files, locales, icon and `docs/`.
+- The bundle patch row now names `dsh-message-manager`, so the installed bundle resolves from the npm package, a GitHub spec, a tarball or a linked directory alike.
+- Plugin detail page: `docs/DETAIL.md` / `docs/DETAIL.zh.md` with a single text-free `preview.svg`, declared through `meta.detail`; `meta.description` now carries the full capability, entry points and limitations for the Plugin Manager and market listing.
+- README rewritten: install sources (npm / GitHub / tgz / local directory), the header dialog walkthrough, command and tool reference, queued-apply rules, restore boundaries, limitations, and a maintainer publish procedure.
+- Published to npm as `dsh-message-manager@1.5.0`, and verified end to end by installing that spec through `plugin_manager` (pnpm resolved the registry tarball, the bundle activated, `message_manager` answered).
+- Plugin market: added the community index submission at `market/awesome-dsh-plugin.yml` (category `session`) and documented how the market indexes work, since DSH ships no official index. Repository gained the `dsh-plugin` topic.
+
 ## 1.4.1
 
 - The message list section starts collapsed in the header dialog, keeping the turns view in focus; click its header (chevron) to expand. The section keeps its select-all and batch-delete actions usable while collapsed.
