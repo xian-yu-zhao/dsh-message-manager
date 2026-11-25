@@ -30,13 +30,18 @@ import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import {
+  addTurnTokens,
   deletedFromSurface,
+  formatBatches,
+  matchUndoBatches,
+  pickUndoBatch,
   foldSurface,
   formatList,
   formatTurns,
   hasToolChange,
   isTombstoneKind,
   itemsFromSurface,
+  planClean,
   planDeletion,
   tombstoneData,
   turnsFromSurface,
@@ -72,6 +77,8 @@ export const inject = ['sessions', 'agents', 'commands', 'tools']
 const RESTORED_PREFIX = 'restored-assistant-'
 const PENDING_TYPE = 'plugin:context-manager/pending'
 const ACK_TYPE = 'plugin:context-manager/ack'
+/** Audit ledger: one record per user-visible batch operation. */
+const BATCH_TYPE = 'plugin:context-manager/batch'
 /** Queue record types older releases wrote; still applied after an upgrade. */
 const LEGACY_PENDING_TYPES = ['plugin:message-manager/pending']
 const LEGACY_ACK_TYPES = ['plugin:message-manager/ack']
@@ -104,6 +111,25 @@ function surfaceEventsSync(session) {
   return session.surface.nodes
     .map((seq) => session.eventAt(seq))
     .filter((event) => event !== undefined)
+}
+
+/** Build an optional seq→tokens map from the token-meter service (when available). */
+function buildTokensBySeq(ctx, session) {
+  try {
+    const meter = ctx.tokenMeter
+    if (meter === undefined || meter === null || typeof meter.measure !== 'function') return undefined
+    const measurement = meter.measure(session)
+    if (measurement === undefined || measurement === null || !Array.isArray(measurement.nodes)) return undefined
+    const map = new Map()
+    for (const node of measurement.nodes) {
+      if (node !== null && typeof node === 'object' && Number.isSafeInteger(node.seq)) {
+        map.set(node.seq, node.tokens)
+      }
+    }
+    return map
+  } catch (_error) {
+    return undefined
+  }
 }
 
 /**
@@ -158,13 +184,13 @@ function openStepOf(session) {
 }
 
 /** Append tombstone replacements for one plan inside an open turn/step. */
-function appendTombstones(session, runs, turn, step) {
+function appendTombstones(session, runs, turn, step, batchId = undefined) {
   const tombstoneSeqs = []
   try {
     for (const run of runs) {
       const event = session.append(
         'developer/message',
-        tombstoneData(turn, step, randomUUID()),
+        tombstoneData(turn, step, randomUUID(), batchId),
         {
           surfaceOp: { op: 'replace', startSeq: run.startSeq, endSeq: run.endSeq },
           sourceEventSeqs: run.seqs,
@@ -231,8 +257,14 @@ function durableQueue(ctx, session) {
     } else if (record.type === PENDING_TYPE || LEGACY_PENDING_TYPES.includes(record.type)) {
       const op = record.data?.op
       const targetSeq = record.data?.targetSeq
+      const batchId = record.data?.batchId
       if ((op === 'delete' || op === 'restore' || op === 'delete-turn') && Number.isSafeInteger(targetSeq)) {
-        state.pending.set(record.seq, { recordSeq: record.seq, op, targetSeq })
+        state.pending.set(record.seq, {
+          recordSeq: record.seq,
+          op,
+          targetSeq,
+          batchId: typeof batchId === 'string' ? batchId : undefined,
+        })
       }
     }
   }
@@ -242,8 +274,12 @@ function durableQueue(ctx, session) {
 }
 
 /** Durably enqueue one operation; plugin records need no open turn/step. */
-function appendPending(session, op, targetSeq) {
-  return appendPluginRecord(session, PENDING_TYPE, { op, targetSeq })
+function appendPending(session, op, targetSeq, batchId = undefined) {
+  return appendPluginRecord(session, PENDING_TYPE, {
+    op,
+    targetSeq,
+    ...typeof batchId === 'string' && batchId.length > 0 ? { batchId } : {},
+  })
 }
 
 /** Acknowledge one pending record so restarts and replays leave it alone. */
@@ -253,6 +289,113 @@ function appendAck(session, pendingSeq, result, detail) {
     result,
     ...typeof detail === 'string' && detail.length > 0 ? { detail: detail.slice(0, 300) } : {},
   })
+}
+
+/** Append one audit ledger record; plugin records need no open turn/step. */
+function appendBatchLedger(session, entry) {
+  return appendPluginRecord(session, BATCH_TYPE, {
+    batchId: entry.batchId,
+    op: entry.op,
+    seqs: Array.isArray(entry.seqs) ? entry.seqs.slice(0, 200) : [],
+    tombstoneSeqs: Array.isArray(entry.tombstoneSeqs) ? entry.tombstoneSeqs.slice(0, 200) : [],
+    ...Number.isSafeInteger(entry.count) && entry.count > 0 ? { count: entry.count } : {},
+    estimatedFreedTokens: Number.isSafeInteger(entry.estimatedFreedTokens) ? entry.estimatedFreedTokens : 0,
+    result: entry.result,
+    ...typeof entry.reason === 'string' && entry.reason.length > 0 ? { reason: entry.reason.slice(0, 300) } : {},
+  })
+}
+
+/** Per-plugin-instance batch ledger scan state, keyed by ctx then session id. */
+const batchCaches = new WeakMap()
+
+/**
+ * Batch ledger entries in log order, incrementally.
+ *
+ * The ledger is a plugin record inside the append-only session log, so the
+ * audit trail travels with the session, survives restarts, and never rewrites
+ * a past record. Each record carries the batch id, the target seqs, the
+ * tombstones it wrote, the estimated relief, and the outcome.
+ */
+function batchesFromLog(ctx, session) {
+  let cache = batchCaches.get(ctx)
+  if (cache === undefined) {
+    cache = new Map()
+    batchCaches.set(ctx, cache)
+  }
+  const state = cache.get(session.id) ?? { checkedTo: -1, entries: [] }
+  const events = session.snapshotEvents(Math.max(0, state.checkedTo + 1))
+  for (const event of events) {
+    const record = pluginRecordOf(event)
+    if (record === undefined || record.type !== BATCH_TYPE) continue
+    const data = record.data ?? {}
+    if (typeof data.batchId !== 'string') continue
+    state.entries.push({
+      recordSeq: record.seq,
+      time: event.time,
+      batchId: data.batchId,
+      op: typeof data.op === 'string' ? data.op : 'delete',
+      seqs: Array.isArray(data.seqs) ? data.seqs : [],
+      tombstoneSeqs: Array.isArray(data.tombstoneSeqs) ? data.tombstoneSeqs : [],
+      count: Number.isSafeInteger(data.count) ? data.count : undefined,
+      estimatedFreedTokens: Number.isSafeInteger(data.estimatedFreedTokens) ? data.estimatedFreedTokens : 0,
+      result: typeof data.result === 'string' ? data.result : 'applied',
+      reason: typeof data.reason === 'string' ? data.reason : undefined,
+    })
+  }
+  if (events.length > 0) state.checkedTo = events[events.length - 1].seq
+  cache.set(session.id, state)
+  return state.entries
+}
+
+/** List the audit ledger for one live session. */
+async function listBatches(ctx, agent) {
+  const session = liveSession(ctx, agent)
+  const batches = batchesFromLog(ctx, session)
+  return { text: formatBatches(batches), batches }
+}
+
+/**
+ * Undo one batch by restoring the tombstones it wrote.
+ *
+ * Undo never invents a new restore mechanism: it reuses the queued restore
+ * path, so the raw log stays append-only and the restore keeps its usual
+ * semantics (user/context at position, assistant content at the tail).
+ */
+async function undoBatch(ctx, agent, batchId) {
+  const session = liveSession(ctx, agent)
+  const batches = batchesFromLog(ctx, session)
+  const matches = matchUndoBatches(batches, batchId)
+  const isNamed = typeof batchId === 'string' && batchId.length > 0
+  if (isNamed && matches.length > 1 && !matches.some((entry) => entry.batchId === batchId)) {
+    throw new Error(`批次前缀有歧义（匹配 ${matches.length} 条），请给更长的前缀或完整 batchId（/ctxmgr batches 查看台账）。`)
+  }
+  const target = pickUndoBatch(batches, batchId)
+  if (target === undefined) {
+    throw new Error(typeof batchId === 'string' && batchId.length > 0
+      ? '找不到该批次记录（/ctxmgr batches 查看台账）。'
+      : '还没有可撤销的批次记录（台账为空，或只有恢复类操作）。')
+  }
+  const restoreSeqs = target.tombstoneSeqs.filter((seq) => session.surface.nodes.includes(seq))
+  if (restoreSeqs.length === 0) throw new Error('该批次已没有仍在表面的删除记录（可能已恢复过）。')
+  const undoBatchId = randomUUID()
+  const result = await restoreMessages(ctx, agent, restoreSeqs, { batchId: undoBatchId })
+  appendBatchLedger(session, {
+    batchId: undoBatchId,
+    op: 'undo',
+    seqs: restoreSeqs,
+    tombstoneSeqs: [],
+    count: restoreSeqs.length,
+    estimatedFreedTokens: 0,
+    result: 'queued',
+    reason: target.batchId,
+  })
+  const short = target.batchId.slice(0, 8)
+  return {
+    text: `撤销批次 ${short}（${target.op}）：${result.text}`,
+    note: '用户与上下文消息回到原位；助手内容与工具结果会追加到末尾（序号会变）。',
+    batchId: target.batchId,
+    count: restoreSeqs.length,
+  }
 }
 
 /**
@@ -405,7 +548,8 @@ function restoreOne(session, tombstoneSeq, turn, step) {
 async function listMessages(ctx, agent) {
   const session = liveSession(ctx, agent)
   const events = await readSurfaceEvents(ctx, session)
-  const items = itemsFromSurface(events)
+  const tokensBySeq = buildTokensBySeq(ctx, session)
+  const items = itemsFromSurface(events, tokensBySeq)
   const bySeq = new Map(session.snapshotEvents().map((event) => [event.seq, event]))
   const deleted = deletedFromSurface(events, bySeq)
   const pending = durableQueue(ctx, session)
@@ -413,13 +557,18 @@ async function listMessages(ctx, agent) {
 }
 
 /** Delete one or more messages now when safe, otherwise queue them durably. */
-async function deleteMessages(ctx, agent, seqs) {
+async function deleteMessages(ctx, agent, seqs, options = {}) {
   const unique = [...new Set(seqs)]
   if (unique.length === 0 || unique.some((seq) => !Number.isSafeInteger(seq) || seq < 0)) {
     throw new Error('序号必须是非负整数。')
   }
+  const batchId = typeof options.batchId === 'string' && options.batchId.length > 0
+    ? options.batchId
+    : randomUUID()
+  const opName = typeof options.op === 'string' && options.op.length > 0 ? options.op : 'delete'
   const session = liveSession(ctx, agent)
   const events = await readSurfaceEvents(ctx, session)
+  const tokensBySeq = buildTokensBySeq(ctx, session)
   const targets = []
   for (const seq of unique) {
     const plan = planDeletion(events, seq)
@@ -435,23 +584,45 @@ async function deleteMessages(ctx, agent, seqs) {
   }
   if (targets.length === 0) throw new Error('选中的消息都已不在当前模型上下文中。')
 
+  // Items are always priced (meter when available, else the local heuristic),
+  // so the reported relief never collapses to 0 when the meter is absent.
+  const tokensOfSeq = new Map(itemsFromSurface(events, tokensBySeq).map((item) => [item.seq, item.tokens ?? 0]))
+  let estimatedFreedTokens = 0
+  for (const target of targets) {
+    for (const run of target.plan.runs) {
+      for (const seq of run.seqs) estimatedFreedTokens += tokensOfSeq.get(seq) ?? 0
+    }
+  }
+
   const open = openStepOf(session)
   const touchesOpenStep = open !== undefined
     && targets.some((target) => target.plan.indices.some((index) => events[index].seq >= open.startSeq))
   if (open !== undefined && !touchesOpenStep) {
     let count = 0
+    const tombstoneSeqs = []
     for (const target of targets) {
       // Re-plan against the live surface because an earlier target may have
       // already removed this target as part of the same tool group.
       const current = surfaceEventsSync(session)
       const plan = planDeletion(current, target.seq)
       if (!plan.ok) continue
-      appendTombstones(session, plan.runs, open.turn, open.step)
+      tombstoneSeqs.push(...appendTombstones(session, plan.runs, open.turn, open.step, batchId))
       count += plan.count
     }
-    return {
-      text: `已从模型上下文删除 ${count} 条消息（会话日志与聊天记录仍保留）。`,
+    appendBatchLedger(session, {
+      batchId,
+      op: opName,
+      seqs: targets.map((target) => target.seq),
+      tombstoneSeqs,
       count,
+      estimatedFreedTokens,
+      result: 'applied',
+    })
+    return {
+      text: `已从模型上下文删除 ${count} 条消息，估算释放约 ${estimatedFreedTokens.toLocaleString('en-US')} tokens（会话日志与聊天记录仍保留）。批次 ${batchId.slice(0, 8)}，可用 /ctxmgr undo-batch 撤销。`,
+      count,
+      estimatedFreedTokens,
+      batchId,
       queued: false,
     }
   }
@@ -462,7 +633,7 @@ async function deleteMessages(ctx, agent, seqs) {
   let added = 0
   for (const target of targets) {
     if (queuedTargets.has(target.seq)) continue
-    appendPending(session, 'delete', target.seq)
+    appendPending(session, 'delete', target.seq, batchId)
     queuedTargets.add(target.seq)
     added += 1
   }
@@ -471,15 +642,44 @@ async function deleteMessages(ctx, agent, seqs) {
   }
   return {
     text: added === 0
-      ? '选中的消息已在删除队列中，将在下一回合开始时生效。'
-      : `已加入删除队列：${added} 条消息将在下一回合开始时从模型上下文移除（会话日志与聊天记录仍保留）。`,
+      ? '选中的消息已在删除队列中，将在下一次请求开始时生效。'
+      : `已加入删除队列：${added} 条消息将在下一次请求开始时从模型上下文移除，估算释放约 ${estimatedFreedTokens.toLocaleString('en-US')} tokens（会话日志与聊天记录仍保留）。批次 ${batchId.slice(0, 8)}，下一次请求生效后可用 /ctxmgr undo-batch 撤销。`,
     count: added,
+    estimatedFreedTokens,
+    batchId,
     queued: true,
   }
 }
 
+/** Token-budget cleanup: plan candidates then delete them via the normal pipeline. */
+async function cleanMessages(ctx, agent, targetTokens, options) {
+  const session = liveSession(ctx, agent)
+  const events = await readSurfaceEvents(ctx, session)
+  const tokensBySeq = buildTokensBySeq(ctx, session)
+  const items = itemsFromSurface(events, tokensBySeq)
+  const cleanPlan = planClean(items, targetTokens, options)
+  if (cleanPlan.chosen.length === 0) {
+    return {
+      text: '没有可清理的消息（只有用户/上下文消息，或剩余消息都太小、太新被保护）。token 数为启发式估算，实际可能略少。',
+      count: 0,
+      estimatedFreedTokens: 0,
+      queued: false,
+    }
+  }
+  const result = await deleteMessages(ctx, agent, cleanPlan.chosen, { op: 'clean' })
+  return {
+    text: `clean：目标 ${targetTokens.toLocaleString('en-US')} tokens，实际估算释放约 ${result.estimatedFreedTokens.toLocaleString('en-US')} tokens（token 数为启发式估算）。${result.text}`,
+    count: result.count,
+    estimatedFreedTokens: result.estimatedFreedTokens,
+    queued: result.queued,
+  }
+}
+
 /** Queue one or more tombstones for restore at the next request. */
-async function restoreMessages(ctx, agent, tombstoneSeqs) {
+async function restoreMessages(ctx, agent, tombstoneSeqs, options = {}) {
+  const batchId = typeof options.batchId === 'string' && options.batchId.length > 0
+    ? options.batchId
+    : undefined
   const unique = [...new Set(tombstoneSeqs)]
   if (unique.length === 0 || unique.some((seq) => !Number.isSafeInteger(seq) || seq < 0)) {
     throw new Error('删除记录序号必须是非负整数。')
@@ -505,7 +705,7 @@ async function restoreMessages(ctx, agent, tombstoneSeqs) {
   let added = 0
   for (const seq of accepted) {
     if (queuedTargets.has(seq)) continue
-    appendPending(session, 'restore', seq)
+    appendPending(session, 'restore', seq, batchId)
     queuedTargets.add(seq)
     added += 1
   }
@@ -514,8 +714,8 @@ async function restoreMessages(ctx, agent, tombstoneSeqs) {
   }
   return {
     text: added === 0
-      ? '选中的删除记录已在恢复队列中，将在下一回合开始时恢复。'
-      : `已加入恢复队列：${added} 条删除记录将在下一回合开始时恢复到模型上下文。`,
+      ? '选中的删除记录已在恢复队列中，将在下一次请求开始时恢复。'
+      : `已加入恢复队列：${added} 条删除记录将在下一次请求开始时恢复到模型上下文。`,
     count: added,
     queued: true,
   }
@@ -527,15 +727,20 @@ async function listTurns(ctx, agent) {
   const events = await readSurfaceEvents(ctx, session)
   const bySeq = new Map(session.snapshotEvents().map((event) => [event.seq, event]))
   const open = openStepOf(session)
-  const turns = turnsFromSurface(events, bySeq).map((turn) => ({
-    ...turn,
-    inProgress: open !== undefined && turn.seqs.some((seq) => seq >= open.startSeq),
-  }))
+  const tokensBySeq = buildTokensBySeq(ctx, session)
+  const items = itemsFromSurface(events, tokensBySeq)
+  const turns = addTurnTokens(
+    turnsFromSurface(events, bySeq).map((turn) => ({
+      ...turn,
+      inProgress: open !== undefined && turn.seqs.some((seq) => seq >= open.startSeq),
+    })),
+    items,
+  )
   return { text: formatTurns(turns), turns }
 }
 
 /** Delete whole conversation turns now when safe, otherwise queue them durably. */
-async function deleteTurns(ctx, agent, turnNums) {
+async function deleteTurns(ctx, agent, turnNums, options = {}) {
   const unique = [...new Set(turnNums)]
   if (unique.length === 0 || unique.some((num) => !Number.isSafeInteger(num) || num < 0)) {
     throw new Error('轮号必须是非负整数（list-turns 查看）。')
@@ -544,7 +749,20 @@ async function deleteTurns(ctx, agent, turnNums) {
   const events = await readSurfaceEvents(ctx, session)
   const bySeq = new Map(session.snapshotEvents().map((event) => [event.seq, event]))
   const open = openStepOf(session)
-  const all = turnsFromSurface(events, bySeq)
+  const tokensBySeq = buildTokensBySeq(ctx, session)
+  const batchId = typeof options.batchId === 'string' && options.batchId.length > 0
+    ? options.batchId
+    : randomUUID()
+  const items = itemsFromSurface(events, tokensBySeq)
+  // Attribute each item's tokens to its turn (same rule as turn grouping).
+  const tokensByTurn = new Map()
+  for (const item of items) {
+    tokensByTurn.set(item.turn, (tokensByTurn.get(item.turn) ?? 0) + (item.tokens ?? 0))
+  }
+  const all = turnsFromSurface(events, bySeq).map((turn) => ({
+    ...turn,
+    tokens: tokensByTurn.get(turn.turn) ?? 0,
+  }))
   const targets = []
   for (const num of unique) {
     const turn = all.find((entry) => entry.turn === num)
@@ -556,22 +774,37 @@ async function deleteTurns(ctx, agent, turnNums) {
   }
   if (targets.length === 0) throw new Error('选中的轮都已不在当前上下文中。')
 
+  const estimatedFreedTokens = targets.reduce((total, turn) => total + (turn.tokens ?? 0), 0)
+
   const touchesOpen = open !== undefined
     && targets.some((turn) => turn.seqs.some((seq) => seq >= open.startSeq))
   if (open !== undefined && !touchesOpen) {
     let turns = 0
     let messages = 0
+    const tombstoneSeqs = []
     for (const turn of targets) {
-      const done = deleteTurnNow(session, turn.turn, open.turn, open.step)
+      const done = deleteTurnNow(session, turn.turn, open.turn, open.step, batchId)
       if (done !== null) {
         turns += 1
-        messages += done
+        messages += done.count
+        tombstoneSeqs.push(...done.tombstoneSeqs)
       }
     }
+    appendBatchLedger(session, {
+      batchId,
+      op: 'delete-turn',
+      seqs: targets.map((turn) => turn.turn),
+      tombstoneSeqs,
+      count: messages,
+      estimatedFreedTokens,
+      result: 'applied',
+    })
     return {
-      text: `已从模型上下文删除 ${turns} 轮对话（共 ${messages} 条消息；会话日志与聊天记录仍保留）。`,
+      text: `已从模型上下文删除 ${turns} 轮对话（共 ${messages} 条消息，估算释放约 ${estimatedFreedTokens.toLocaleString('en-US')} tokens；会话日志与聊天记录仍保留）。批次 ${batchId.slice(0, 8)}，可用 /ctxmgr undo-batch 撤销。`,
       turns,
       messages,
+      estimatedFreedTokens,
+      batchId,
       queued: false,
     }
   }
@@ -582,7 +815,7 @@ async function deleteTurns(ctx, agent, turnNums) {
   let added = 0
   for (const turn of targets) {
     if (queued.has(turn.turn)) continue
-    appendPending(session, 'delete-turn', turn.turn)
+    appendPending(session, 'delete-turn', turn.turn, batchId)
     queued.add(turn.turn)
     added += 1
   }
@@ -591,9 +824,11 @@ async function deleteTurns(ctx, agent, turnNums) {
   }
   return {
     text: added === 0
-      ? '选中的轮已在删除队列中，将在下一回合开始时生效。'
-      : `已加入删除队列：${added} 轮对话将在下一回合开始时从模型上下文移除（会话日志与聊天记录仍保留）。`,
+      ? '选中的轮已在删除队列中，将在下一次请求开始时生效。'
+      : `已加入删除队列：${added} 轮对话将在下一次请求开始时从模型上下文移除，估算释放约 ${estimatedFreedTokens.toLocaleString('en-US')} tokens（会话日志与聊天记录仍保留）。`,
     turns: added,
+    estimatedFreedTokens,
+    batchId,
     queued: true,
   }
 }
@@ -605,12 +840,13 @@ async function deleteTurns(ctx, agent, turnNums) {
  * and text at the tail). Tombstones already on the surface stay untouched.
  * @returns the number of messages removed, or null when none remain.
  */
-function deleteTurnNow(session, turnNum, curTurn, curStep) {
+function deleteTurnNow(session, turnNum, curTurn, curStep, batchId = undefined) {
   const bySeq = new Map(session.snapshotEvents().map((event) => [event.seq, event]))
   const turn = turnsFromSurface(surfaceEventsSync(session), bySeq)
     .find((entry) => entry.turn === turnNum)
   if (turn === undefined || turn.seqs.length === 0) return null
   const planned = new Set()
+  const tombstoneSeqs = []
   let count = 0
   for (const seq of turn.seqs) {
     if (planned.has(seq)) continue
@@ -619,11 +855,11 @@ function deleteTurnNow(session, turnNum, curTurn, curStep) {
     const current = surfaceEventsSync(session)
     const plan = planDeletion(current, seq)
     if (!plan.ok) continue
-    appendTombstones(session, plan.runs, curTurn, curStep)
+    tombstoneSeqs.push(...appendTombstones(session, plan.runs, curTurn, curStep, batchId))
     for (const index of plan.indices) planned.add(current[index].seq)
     count += plan.count
   }
-  return count
+  return { count, tombstoneSeqs }
 }
 
 /** Per-plugin-instance agent listener registries, keyed by plugin ctx. */
@@ -650,26 +886,85 @@ function applyQueuedOperations(ctx, agent, turn, step) {
   if (session === undefined) return
   const queue = durableQueue(ctx, session)
   if (queue.length === 0) return
+  // Price the current surface once, so a replayed entry records the relief it
+  // actually produced instead of a zero placeholder.
+  const pricedItems = itemsFromSurface(surfaceEventsSync(session), buildTokensBySeq(ctx, session))
+  const tokensOfSeq = new Map(pricedItems.map((item) => [item.seq, item.tokens ?? 0]))
+  const tokensByTurn = new Map()
+  for (const item of pricedItems) {
+    tokensByTurn.set(item.turn, (tokensByTurn.get(item.turn) ?? 0) + (item.tokens ?? 0))
+  }
+  const freedOfPlan = (plan) => plan.runs.reduce((sum, run) => sum
+    + run.seqs.reduce((inner, seq) => inner + (tokensOfSeq.get(seq) ?? 0), 0), 0)
   for (const entry of queue) {
     try {
       if (entry.op === 'delete') {
         const plan = planDeletion(surfaceEventsSync(session), entry.targetSeq)
         if (!plan.ok) {
           appendAck(session, entry.recordSeq, 'skipped', `target #${entry.targetSeq} ${plan.reason}`)
+          appendBatchLedger(session, {
+            batchId: entry.batchId ?? `pending-${entry.recordSeq}`,
+            op: 'delete',
+            seqs: [entry.targetSeq],
+            tombstoneSeqs: [],
+            estimatedFreedTokens: 0,
+            result: 'skipped',
+            reason: `target #${entry.targetSeq} ${plan.reason}`,
+          })
           continue
         }
-        appendTombstones(session, plan.runs, turn, step)
+        const tombstoneSeqs = appendTombstones(session, plan.runs, turn, step, entry.batchId)
         appendAck(session, entry.recordSeq, 'applied')
+        appendBatchLedger(session, {
+          batchId: entry.batchId ?? `pending-${entry.recordSeq}`,
+          op: 'delete',
+          seqs: [entry.targetSeq],
+          tombstoneSeqs,
+          count: plan.count,
+          estimatedFreedTokens: freedOfPlan(plan),
+          result: 'applied',
+        })
       } else if (entry.op === 'delete-turn') {
-        const done = deleteTurnNow(session, entry.targetSeq, turn, step)
+        const done = deleteTurnNow(session, entry.targetSeq, turn, step, entry.batchId)
         if (done === null) {
           appendAck(session, entry.recordSeq, 'skipped', `turn #${entry.targetSeq} has no remaining content`)
+          appendBatchLedger(session, {
+            batchId: entry.batchId ?? `pending-${entry.recordSeq}`,
+            op: 'delete-turn',
+            seqs: [entry.targetSeq],
+            tombstoneSeqs: [],
+            estimatedFreedTokens: 0,
+            result: 'skipped',
+            reason: `turn #${entry.targetSeq} has no remaining content`,
+          })
         } else {
           appendAck(session, entry.recordSeq, 'applied')
+          appendBatchLedger(session, {
+            batchId: entry.batchId ?? `pending-${entry.recordSeq}`,
+            op: 'delete-turn',
+            seqs: [entry.targetSeq],
+            tombstoneSeqs: done.tombstoneSeqs,
+            count: done.count,
+            estimatedFreedTokens: tokensByTurn.get(entry.targetSeq) ?? 0,
+            result: 'applied',
+          })
         }
       } else {
         restoreOne(session, entry.targetSeq, turn, step)
         appendAck(session, entry.recordSeq, 'applied')
+        // Close the undo ledger entry once the restore actually landed, so the
+        // audit trail does not stay stuck at "queued".
+        if (typeof entry.batchId === 'string') {
+          appendBatchLedger(session, {
+            batchId: entry.batchId,
+            op: 'undo',
+            seqs: [entry.targetSeq],
+            tombstoneSeqs: [],
+            count: 1,
+            estimatedFreedTokens: 0,
+            result: 'applied',
+          })
+        }
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
@@ -723,6 +1018,17 @@ function parseCommand(rawInput) {
   const head = parts[0].toLowerCase()
   if (head === 'list' || head === 'ls') return { op: 'list' }
   if (head === 'turns' || head === 'list-turns' || head === 'ls-turns') return { op: 'list-turns' }
+  if (head === 'clean') {
+    const rest = text.slice(head.length).trim()
+    if (rest.length === 0) return { op: 'invalid', reason: '缺少要释放的 token 预算。' }
+    if (!/^\d+$/.test(rest)) return { op: 'invalid', reason: '目标 token 数必须是正整数。' }
+    return { op: 'clean', targetTokens: Number(rest) }
+  }
+  if (head === 'batches' || head === 'ledger' || head === 'audit') return { op: 'batches' }
+  if (head === 'undo-batch' || head === 'undobatch' || head === 'undo-last' || head === 'undolast') {
+    const rest = text.slice(head.length).trim()
+    return rest.length === 0 ? { op: 'undo-batch' } : { op: 'undo-batch', batchId: rest }
+  }
   const deleteTurn = head === 'deleteturn' || head === 'delturn' || head === 'dt'
   if (head === 'delete' || head === 'rm' || head === 'restore' || head === 'undo' || deleteTurn) {
     const rest = text.slice(head.length).trim()
@@ -745,8 +1051,8 @@ export function apply(ctx) {
 
   const command = ctx.commands.register({
     name: 'ctxmgr',
-    description: '列出、批量删除或恢复当前会话中的单条消息，并按轮删除整轮对话（仅移出/恢复模型上下文，保留原始日志）。',
-    input: { hint: 'list | turns | delete <序号,...> | deleteturn <轮号,...> | restore <删除记录序号,...>' },
+    description: '列出、批量删除或恢复当前会话中的单条消息，并按轮删除整轮对话，支持按 token 预算自动清理（仅移出/恢复模型上下文，保留原始日志）。',
+    input: { hint: 'list | turns | delete <序号,...> | deleteturn <轮号,...> | clean <目标tokens> | batches | undo-batch [batchId] | restore <删除记录序号,...>' },
     recordInput: false,
     async handler(invocation) {
       try {
@@ -767,11 +1073,23 @@ export function apply(ctx) {
           const result = await deleteTurns(ctx, invocation.agent, parsed.seqs)
           return { kind: 'success', text: result.text }
         }
+        if (parsed.op === 'clean') {
+          const result = await cleanMessages(ctx, invocation.agent, parsed.targetTokens, {})
+          return { kind: 'success', text: result.text }
+        }
+        if (parsed.op === 'batches') {
+          const result = await listBatches(ctx, invocation.agent)
+          return { kind: 'success', text: result.text }
+        }
+        if (parsed.op === 'undo-batch') {
+          const result = await undoBatch(ctx, invocation.agent, parsed.batchId)
+          return { kind: 'success', text: result.text }
+        }
         if (parsed.op === 'restore') {
           const result = await restoreMessages(ctx, invocation.agent, parsed.seqs)
           return { kind: 'success', text: result.text }
         }
-        return { kind: 'error', text: `${parsed.reason} 用法：/ctxmgr list | /ctxmgr turns | /ctxmgr delete <序号,...> | /ctxmgr deleteturn <轮号,...> | /ctxmgr restore <删除记录序号,...>` }
+        return { kind: 'error', text: `${parsed.reason} 用法：/ctxmgr list | /ctxmgr turns | /ctxmgr delete <序号,...> | /ctxmgr deleteturn <轮号,...> | /ctxmgr clean <目标tokens> | /ctxmgr batches | /ctxmgr undo-batch [batchId] | /ctxmgr restore <删除记录序号,...>` }
       } catch (error) {
         return { kind: 'error', text: error instanceof Error ? error.message : String(error) }
       }
@@ -780,14 +1098,14 @@ export function apply(ctx) {
 
   const tool = ctx.tools.register({
     name: 'context_manager',
-    description: 'Manage the model context of the current session. Actions: list (current messages plus deleted records and queued operations), list-turns (conversation turns with turn numbers), delete (message seqs; any tool results tied to an assistant message that calls tools go with it), delete-turns (whole turns: the user prompt, the assistant work and reply, and that turn\'s injected context), restore (tombstone seqs from list; user/context restores at its original position, assistant content is appended at the tail). Typical uses: roll back to the start of a turn by deleting that turn and the ones after it, or drop noisy messages that no longer matter. Deletion only affects later model requests; the raw session log and chat transcript are retained. Operations that cannot run safely yet are recorded durably in the session log and applied when the next step starts, surviving restarts. Use only when the user explicitly asks. Requires a live session.',
+    description: 'Manage the model context of the current session. Actions: list (current messages with estimated tokens plus deleted records and queued operations), list-turns (conversation turns with turn numbers), delete (message seqs; any tool results tied to an assistant message that calls tools go with it), delete-turns (whole turns: the user prompt, the assistant work and reply, and that turn\'s injected context), clean (token-budget cleanup: automatically picks large tool/assistant messages ranked by estimated tokens descending, until target tokens are freed; user messages and the most recent messages are protected, and the planner reuses the same delete pipeline), restore (tombstone seqs from list; user/context restores at its original position, assistant content is appended at the tail). Typical uses: roll back to the start of a turn by deleting that turn and the ones after it, or drop noisy messages that no longer matter. All token figures are estimates from a 4-chars-per-token heuristic and can notably underprice CJK text and JSON. Deletion only affects later model requests; the raw session log and chat transcript are retained. Operations that cannot run safely yet are recorded durably in the session log and applied when the next step starts, surviving restarts. Use only when the user explicitly asks. Requires a live session.',
     parameters: {
       type: 'object',
       properties: {
         action: {
           type: 'string',
-          enum: ['list', 'list-turns', 'delete', 'delete-turns', 'restore'],
-          description: 'list messages, list conversation turns, delete message seqs, delete whole turns by turn number, or restore tombstone seqs.',
+          enum: ['list', 'list-turns', 'delete', 'delete-turns', 'clean', 'batches', 'undo-batch', 'restore'],
+          description: 'list messages, list conversation turns, delete message seqs, delete whole turns by turn number, clean by token budget, list the batch audit ledger, undo a batch, or restore tombstone seqs.',
         },
         seq: {
           type: 'integer',
@@ -797,6 +1115,22 @@ export function apply(ctx) {
           type: 'array',
           items: { type: 'integer' },
           description: 'Message seqs for delete, turn numbers for delete-turns, or tombstone seqs for restore (from list/turns output).',
+        },
+        targetTokens: {
+          type: 'integer',
+          description: 'For clean: the token budget (target number of tokens to free).',
+        },
+        minCandidateTokens: {
+          type: 'integer',
+          description: 'For clean: optional minimum estimated tokens for a message to be considered a candidate (default 100).',
+        },
+        protectRecent: {
+          type: 'integer',
+          description: 'For clean: optional number of most recent messages to protect (default 3).',
+        },
+        batchId: {
+          type: 'string',
+          description: 'For undo-batch: optional batch id (or unambiguous prefix) from the ledger; omit to undo the most recent applied batch.',
         },
       },
       required: ['action'],
@@ -839,12 +1173,31 @@ export function apply(ctx) {
         const result = await deleteTurns(ctx, exec.agent, list)
         return { ok: true, text: result.text }
       }
+      if (action === 'clean') {
+        if (!Number.isSafeInteger(args?.targetTokens) || args.targetTokens <= 0) {
+          throw new Error('clean 需要正整数 targetTokens（要释放的 token 预算）。')
+        }
+        const result = await cleanMessages(ctx, exec.agent, args.targetTokens, {
+          minCandidateTokens: args?.minCandidateTokens,
+          protectRecent: args?.protectRecent,
+        })
+        return { ok: true, text: result.text }
+      }
+      if (action === 'batches') {
+        const result = await listBatches(ctx, exec.agent)
+        return { ok: true, text: result.text }
+      }
+      if (action === 'undo-batch') {
+        const result = await undoBatch(ctx, exec.agent,
+          typeof args?.batchId === 'string' ? args.batchId : undefined)
+        return { ok: true, text: result.text }
+      }
       if (action === 'restore') {
         if (list.length === 0) throw new Error('restore 需要已删除记录返回的整数 tombstone seq。')
         const result = await restoreMessages(ctx, exec.agent, list)
         return { ok: true, text: result.text }
       }
-      throw new Error('action 必须是 list、list-turns、delete、delete-turns 或 restore。')
+      throw new Error('action 必须是 list、list-turns、delete、delete-turns、clean、batches、undo-batch 或 restore。')
     },
   })
 

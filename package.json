@@ -1,6 +1,6 @@
 {
   "name": "dsh-context-manager",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "type": "module",
   "description": "Manage a DSH session's model context: delete single messages or whole conversation turns (roll back to the start of any turn, drop noise), and restore them later, without touching the raw session log.",
   "license": "MIT",

@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.7.0
+
+- Token metering: `core.js` gains `estimateMessageTokens`, a heuristic priced like DSH's own `dsh-token-meter` (4 characters ≈ 1 token, +4 per content block, +4 role overhead per message). The message list shows `≈N tok` per message and the current total context occupation; delete, whole-turn delete and clean results report the estimated tokens released. These are estimates only — Chinese text and JSON are markedly underestimated.
+- Budget clean-up: new `/ctxmgr clean <target tokens>` command and `context_manager` action `clean` (optional `targetTokens`, `minCandidateTokens`, `protectRecent`). Candidates are only `tool` / `assistant` messages, sorted by estimated tokens descending; user and context messages are never eligible, the most recent 3 messages are protected by default, candidates below 100 tokens are skipped by default, and the clean stops once the budget is met. Deletion reuses the existing delete pipeline (`planDeletion` + tombstones + durable queue), not a second deletion path.
+- The header dialog gains a budget row at the top: a target-token field plus a clean button.
+- The Host prefers node pricing from `ctx.tokenMeter.measure()` and falls back to the local heuristic when no token meter is injected.
+- Batch ids: every delete, whole-turn delete and budget clean now mints a `batchId`, recorded in the tombstone `source` as `{ kind: 'context-manager', batchId: '<uuid>' }`. `kind` stays the only marker, so tombstones written before batch ids keep working unchanged.
+- Audit ledger: every operation appends one `plugin:context-manager/batch` record to the session log — `batchId`, `op` (`delete` / `delete-turn` / `clean` / `undo`), target `seqs`, written `tombstoneSeqs`, `estimatedFreedTokens`, outcome (`applied` / `queued` / `skipped` / `failed`) and `reason`. The ledger is append-only, persists with the session log, survives restarts and writes no external files.
+- `/ctxmgr batches` (aliases `ledger` / `audit`) lists the ledger, and the `context_manager` tool gains `action=batches`.
+- `/ctxmgr undo-batch` undoes the latest batch, `/ctxmgr undo-batch <batchId prefix>` a specific one (alias `undo-last`); the tool exposes `action=undo-batch` with an optional `batchId`. Undo reuses the existing restore path (durable queue + idempotent ack) instead of a second restore mechanism, and leaves its own `op=undo` ledger entry.
+- Header dialog: each deleted-record row shows the first 8 characters of its batch id, and a "undo last operation" button at the bottom undoes the most recent batch.
+- README: added a 与同类插件的边界 (boundaries against similar plugins) section covering `dsh-context`, `dsh-compact-manager` / `dsh-compression-improved`, `dsh-context-redline`, the same-named `@sulytwelve/dsh-context-manager` and memory plugins, plus the audit ledger section and the new commands and tool actions.
+
 ## 1.6.0
 
 - Renamed the package and bundle from `dsh-message-manager` to `dsh-context-manager` (1.5.0 → 1.6.0): a new npm package plus a renamed GitHub repository. The old package is deprecated on npm in favour of the new one, and the old repository URL redirects to the new one.

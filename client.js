@@ -80,6 +80,21 @@ window.__ModuleLoader__.load({
       turnMeta: '{count} 条',
       expandSection: '展开',
       collapseSection: '折叠',
+      cleanSelected: '按 token 优化 ({count})',
+      tokens: 'tokens（估算）',
+      estimated: '估算值：4 字符 ≈ 1 token，中文与 JSON 会明显低估',
+      totalTokens: '当前总占用 ≈{tokens} tokens（估算）',
+      cleanHint: '清理仅选取大体积工具/助手消息，按估算 token 降序，用户消息与最近 3 条受保护',
+      protectedUser: '用户消息受保护',
+      userTokens: '用户 tokens（保护）：{tokens}',
+      tokenSuffix: '≈{tokens} tok',
+      cleanNote: '清理使用启发式估算，实际释放可能略有偏差',
+      cleaned: '已按预算清理，目标释放 {tokens} tokens（估算）',
+      undoLast: '撤销上次操作',
+      undoDone: '已提交撤销，下一回合恢复。',
+      batchLabel: '批次 {id}',
+      cleanBudget: '预算',
+      cleanInvalid: '请输入正整数 token 预算。',
     }
 
     const en = {
@@ -134,6 +149,21 @@ window.__ModuleLoader__.load({
       turnMeta: '{count} messages',
       expandSection: 'Expand',
       collapseSection: 'Collapse',
+      cleanSelected: 'Optimize by tokens ({count})',
+      tokens: 'tokens (estimated)',
+      estimated: 'Estimate: 4 characters ≈ 1 token; CJK text and JSON are notably underpriced',
+      totalTokens: 'Current usage ≈{tokens} tokens (estimated)',
+      cleanHint: 'Cleaning picks only large tool/assistant messages ranked by estimated tokens; user messages and the most recent 3 messages are protected',
+      protectedUser: 'User messages protected',
+      userTokens: 'User tokens (protected): {tokens}',
+      tokenSuffix: '≈{tokens} tok',
+      cleanNote: 'Cleaning uses heuristic estimates; actual relief may differ',
+      cleaned: 'Cleaned toward {tokens} tokens (estimated)',
+      undoLast: 'Undo last batch',
+      undoDone: 'Undo queued; restores on the next turn.',
+      batchLabel: 'batch {id}',
+      cleanBudget: 'Budget',
+      cleanInvalid: 'Enter a positive integer token budget.',
     }
 
     const CSS = `
@@ -202,6 +232,10 @@ window.__ModuleLoader__.load({
 .dshmm-confirmBar{display:flex;align-items:center;gap:10px;margin:10px 20px 0;padding:8px 10px;border-radius:8px;background:color-mix(in srgb, var(--dsw-alias-state-error-primary) 10%, transparent);color:var(--dsw-alias-label-primary);font-size:12px;line-height:18px;flex:none}
 .dshmm-confirmBar .dshmm-confirmActions{margin-left:auto}
 .dshmm-subtle{font-size:11px;color:var(--dsw-alias-label-secondary)}
+.dshmm-cleanbar{display:flex;align-items:center;gap:8px;margin:8px 20px 0;padding:8px 10px;border-radius:8px;background:color-mix(in srgb, var(--dsw-alias-label-primary) 6%, transparent);flex:none;flex-wrap:wrap}
+.dshmm-cleanlabel{font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary);flex:auto;min-width:0}
+.dshmm-cleaninput{appearance:none;border:0.5px solid var(--dsw-alias-border-l2);border-radius:6px;padding:4px 8px;font:inherit;font-size:11px;line-height:16px;width:96px;background:var(--dsw-alias-bg-overlay);color:var(--dsw-alias-label-primary);font-variant-numeric:tabular-nums}
+.dshmm-cleaninput:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}
 @media (max-width:520px){.dshmm-backdrop{padding:10px}.dshmm-panel{max-height:90vh}.dshmm-footHint{display:none}.dshmm-reason{display:none}}
 `
 
@@ -336,6 +370,26 @@ window.__ModuleLoader__.load({
         && content.some((block) => block?.type === 'tool-addition' || block?.type === 'tool-removal')
     }
 
+    /** Heuristic token estimate (4 chars ≈ 1 token), mirrors the Host estimate; CJK/JSON underpriced. */
+    function estimateTokens(message, isSystem) {
+      if (message === undefined || message === null) return 0
+      const content = Array.isArray(message.content) ? message.content : []
+      if (content.length === 0) return 0
+      if (isSystem) {
+        let chars = 0
+        for (const block of content) chars += block?.type === 'text' ? (block.text?.length ?? 0) : JSON.stringify(block).length
+        return Math.ceil(chars / 4) + 4
+      }
+      let tokens = 0
+      for (const block of content) {
+        if (block === null || typeof block !== 'object') continue
+        if (block.type === 'text' || block.type === 'reasoning') tokens += Math.ceil((block.text?.length ?? 0) / 4) + 4
+        else if (block.type === 'tool-call') tokens += Math.ceil((block.name?.length ?? 0) / 4) + Math.ceil((block.arguments?.length ?? 0) / 4) + 4
+        else tokens += 4 + Math.ceil(JSON.stringify(block).length / 4)
+      }
+      return tokens + 4
+    }
+
     /** Source kinds this plugin writes for tombstones: current, then older releases. */
     const TOMBSTONE_KINDS = ['context-manager', 'message-manager']
 
@@ -385,7 +439,15 @@ window.__ModuleLoader__.load({
           const end = seqs.indexOf(op.endSeq)
           if (start < 0 || end < start) continue
           const removed = seqs.slice(start, end + 1)
-          if (isTombstoneEvent(event)) groups.push({ tombstoneSeq: event.seq, targetSeqs: removed })
+          if (isTombstoneEvent(event)) {
+            groups.push({
+              tombstoneSeq: event.seq,
+              targetSeqs: removed,
+              batchId: typeof event.data?.message?.source?.batchId === 'string'
+                ? event.data.message.source.batchId
+                : undefined,
+            })
+          }
           seqs.splice(start, end - start + 1, event.seq)
         }
       }
@@ -428,6 +490,7 @@ window.__ModuleLoader__.load({
           blocks: content.length,
           callIds: toolCallIdsOf(event),
           toolCallId: event.type === 'tool/result' && typeof message.toolCallId === 'string' ? message.toolCallId : undefined,
+          tokens: content.length === 0 ? 0 : estimateTokens(message, event.type === 'system/message'),
         })
       }
 
@@ -571,6 +634,7 @@ window.__ModuleLoader__.load({
       const panelRef = useRef(null)
       // The per-message list is secondary to the turns view; start collapsed.
       const [currentCollapsed, setCurrentCollapsed] = useState(true)
+      const [cleanBudget, setCleanBudget] = useState('20000')
 
       useEffect(() => {
         const panel = panelRef.current
@@ -590,6 +654,7 @@ window.__ModuleLoader__.load({
         return () => { document.removeEventListener('keydown', onKeyDown, true) }
       }, [manager, busy])
 
+      const totalTokens = items.reduce((sum, item) => sum + (item.tokens ?? 0), 0)
       const currentSelectedSeqs = items.filter((item) => selectedItems.has(item.seq)).map((item) => item.seq)
       const restorableDeleted = deleted.filter((group) => group.restorable)
       const deletedSelectedSeqs = restorableDeleted
@@ -603,8 +668,9 @@ window.__ModuleLoader__.load({
       const turnGroups = useMemo(() => {
         const byTurn = new Map()
         for (const item of items) {
-          const group = byTurn.get(item.turn) ?? { turn: item.turn, items: [] }
+          const group = byTurn.get(item.turn) ?? { turn: item.turn, items: [], tokens: 0 }
           group.items.push(item)
+          group.tokens = (group.tokens ?? 0) + (item.tokens ?? 0)
           byTurn.set(item.turn, group)
         }
         return [...byTurn.values()].sort((a, b) => a.turn - b.turn)
@@ -678,6 +744,50 @@ window.__ModuleLoader__.load({
         }
       }
 
+      const runClean = async (targetTokens) => {
+        if (busy || !Number.isSafeInteger(targetTokens) || targetTokens <= 0) return
+        setBusy(true)
+        setStatus(undefined)
+        setPending(undefined)
+        try {
+          const execution = await manager.executeCommand(sessionId, `/ctxmgr clean ${targetTokens}`)
+          const result = execution?.result !== undefined ? execution.result : execution
+          if (result !== undefined && result !== null && result.kind === 'error') {
+            setStatus({ kind: 'error', text: result.text || t('failed') })
+            return
+          }
+          const text = result !== undefined && result !== null && result.kind === 'success' ? result.text : undefined
+          setStatus({ kind: 'success', text: text || t('cleaned', { tokens: targetTokens.toLocaleString('en-US') }) })
+          setSelectedItems(new Set())
+        } catch (error) {
+          setStatus({ kind: 'error', text: error instanceof Error ? error.message : String(error) })
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      const runUndo = async () => {
+        if (busy) return
+        setBusy(true)
+        setStatus(undefined)
+        setPending(undefined)
+        try {
+          const execution = await manager.executeCommand(sessionId, '/ctxmgr undo-batch')
+          const result = execution?.result !== undefined ? execution.result : execution
+          if (result !== undefined && result !== null && result.kind === 'error') {
+            setStatus({ kind: 'error', text: result.text || t('failed') })
+            return
+          }
+          const text = result !== undefined && result !== null && result.kind === 'success' ? result.text : undefined
+          setStatus({ kind: 'success', text: text || t('undoDone') })
+          setSelectedDeleted(new Set())
+        } catch (error) {
+          setStatus({ kind: 'error', text: error instanceof Error ? error.message : String(error) })
+        } finally {
+          setBusy(false)
+        }
+      }
+
       const confirmPending = () => {
         if (pending === undefined) return
         run(pending.kind === 'turns' ? 'deleteturn' : 'delete', pending.seqs)
@@ -714,6 +824,9 @@ window.__ModuleLoader__.load({
             ' · ',
             formatTime(item.time, locale),
             item.turn > 0 ? ` · T${item.turn}S${item.step}` : '',
+            item.tokens !== undefined && Number.isFinite(item.tokens)
+              ? ` · ${t('tokenSuffix', { tokens: Math.round(item.tokens).toLocaleString('en-US') })}`
+              : '',
           ),
         ),
         h(
@@ -769,6 +882,7 @@ window.__ModuleLoader__.load({
               'div',
               { className: 'dshmm-meta' },
               t('turnMeta', { count: group.items.length }),
+              ` · ${t('tokenSuffix', { tokens: group.tokens.toLocaleString('en-US') })}`,
               inProgress ? ` · ${t('inProgressNote')}` : '',
             ),
           ),
@@ -838,6 +952,7 @@ window.__ModuleLoader__.load({
               'div',
               { className: 'dshmm-meta' },
               t('deletedRecord', { seq: group.tombstoneSeq }),
+              typeof group.batchId === 'string' ? ` · ${t('batchLabel', { id: group.batchId.slice(0, 8) })}` : '',
               reasonKey === undefined ? '' : ` · ${t(reasonKey)}`,
             ),
           ),
@@ -935,6 +1050,39 @@ window.__ModuleLoader__.load({
               ),
             ),
             h('p', { className: 'dshmm-subtitle' }, t('subtitle')),
+            h(
+              'div',
+              { className: 'dshmm-cleanbar' },
+              h('span', { className: 'dshmm-cleanlabel' }, t('cleanHint')),
+              h('input', {
+                type: 'number',
+                min: 1,
+                step: 1000,
+                className: 'dshmm-cleaninput',
+                value: cleanBudget,
+                disabled: busy,
+                'aria-label': t('cleanBudget'),
+                placeholder: t('cleanBudget'),
+                onChange: (event) => setCleanBudget(event.target.value),
+              }),
+              h(
+                'button',
+                {
+                  type: 'button',
+                  className: 'dshmm-small',
+                  disabled: busy,
+                  onClick: () => {
+                    const budget = Number.parseInt(cleanBudget, 10)
+                    if (!Number.isSafeInteger(budget) || budget <= 0) {
+                      setStatus({ kind: 'error', text: t('cleanInvalid') })
+                      return
+                    }
+                    runClean(budget)
+                  },
+                },
+                t('cleanSelected', { count: cleanBudget }),
+              ),
+            ),
           ),
           status === undefined
             ? null
@@ -1080,8 +1228,20 @@ window.__ModuleLoader__.load({
               { className: 'dshmm-footCount' },
               busy
                 ? t('busy')
-                : `${t('count', { count: items.length })}${deleted.length > 0 ? ` · ${t('deletedSection')} ${deleted.length}` : ''}`,
+                : `${t('count', { count: items.length })} · ${t('totalTokens', { tokens: totalTokens.toLocaleString('en-US') })}${deleted.length > 0 ? ` · ${t('deletedSection')} ${deleted.length}` : ''}`,
             ),
+            deleted.length === 0
+              ? null
+              : h(
+                'button',
+                {
+                  type: 'button',
+                  className: 'dshmm-small',
+                  disabled: busy,
+                  onClick: runUndo,
+                },
+                t('undoLast'),
+              ),
             h(
               'span',
               { className: 'dshmm-footHint' },

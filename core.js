@@ -130,12 +130,60 @@ function visibleSurfaceEvent(event) {
   return true
 }
 
+/** Fixed text-density estimate: 4 characters per token (token-meter heuristic). */
+export const ESTIMATE_CHARS_PER_TOKEN = 4
+
+/**
+ * Heuristically price one message in tokens, mirroring the dsh-token-meter
+ * fixed-density heuristic (4 characters per token, plus per-block and role
+ * framing overhead). This is an estimate only: CJK text and dense JSON
+ * underprice badly under this rule, so all token figures surfaced by this
+ * plugin must be labeled as estimates.
+ * @param message - message (event.data for user, event.data.message otherwise).
+ * @param isSystem - price as a rendered system prompt (no per-block overhead).
+ * @returns heuristic tokens; 0 for empty content (e.g. tombstones).
+ */
+export function estimateMessageTokens(message, isSystem = false) {
+  if (message === undefined || message === null) return 0
+  const content = Array.isArray(message.content) ? message.content : []
+  if (content.length === 0) return 0
+  if (isSystem) {
+    let characters = 0
+    for (const block of content) {
+      characters += block?.type === 'text' ? block.text.length : JSON.stringify(block).length
+    }
+    return Math.ceil(characters / ESTIMATE_CHARS_PER_TOKEN) + 4
+  }
+  let tokens = 0
+  for (const block of content) {
+    if (block === null || typeof block !== 'object') continue
+    switch (block.type) {
+      case 'text':
+      case 'reasoning':
+        tokens += Math.ceil((block.text?.length ?? 0) / ESTIMATE_CHARS_PER_TOKEN) + 4
+        break
+      case 'tool-call':
+        tokens += Math.ceil((block.name?.length ?? 0) / ESTIMATE_CHARS_PER_TOKEN)
+          + Math.ceil((block.arguments?.length ?? 0) / ESTIMATE_CHARS_PER_TOKEN)
+          + 4
+        break
+      default:
+        // Merge-extensible/unknown blocks (and image references, whose request
+        // price is route-owned) keep a conservative structural JSON price.
+        tokens += 4 + Math.ceil(JSON.stringify(block).length / ESTIMATE_CHARS_PER_TOKEN)
+    }
+  }
+  return tokens + 4
+}
+
 /**
  * Project current surface events into display items, oldest first.
  * `events` is either a complete surface snapshot or the folded output of
  * {@link foldSurface} resolved back to events.
+ * @param tokensBySeq - optional seq→tokens map (e.g. from ctx.tokenMeter
+ *   measure nodes) overriding the local heuristic per surface node.
  */
-export function itemsFromSurface(events) {
+export function itemsFromSurface(events, tokensBySeq = undefined) {
   const items = []
   let currentTurn = 0
   let currentStep = 0
@@ -146,6 +194,11 @@ export function itemsFromSurface(events) {
     if (!visibleSurfaceEvent(event)) continue
     const message = messageOf(event)
     const content = Array.isArray(message.content) ? message.content : []
+    const tokens = content.length === 0
+      ? 0 // empty/tombstone messages occupy nothing
+      : tokensBySeq !== undefined && tokensBySeq.has(event.seq)
+        ? tokensBySeq.get(event.seq)
+        : estimateMessageTokens(message, event.type === 'system/message')
     const callIds = toolCallIdsOf(event)
     let turn = Number.isSafeInteger(event.data?.turn) ? event.data.turn : undefined
     let step = Number.isSafeInteger(event.data?.step) ? event.data.step : undefined
@@ -171,9 +224,49 @@ export function itemsFromSurface(events) {
       callIds,
       toolCallId: event.type === 'tool/result' && typeof message.toolCallId === 'string' ? message.toolCallId : undefined,
       blocks: content.length,
+      tokens,
     })
   }
   return items
+}
+
+/**
+ * Plan a token-budget "clean": choose an ordered set of deletable messages
+ * whose estimated tokens roughly reach the budget.
+ *
+ * Candidates are only large tool / assistant messages; user and context
+ * messages are never cleaned, and the most recent items on the surface are
+ * protected so the live conversation stays intact. Candidates are ranked by
+ * estimated tokens, descending, and taken until the budget is (first) met.
+ * @param items - display items from {@link itemsFromSurface} (tokens required).
+ * @param targetTokens - the token budget to free.
+ * @param options - minCandidateTokens (default 100) and protectRecent
+ *   (default 3) thresholds.
+ */
+export function planClean(items, targetTokens, options = {}) {
+  const minTokens = options.minCandidateTokens ?? 100
+  const protectRecent = Math.max(0, options.protectRecent ?? 3)
+  const protectedSeqs = new Set(
+    items.slice(Math.max(0, items.length - protectRecent)).map((item) => item.seq),
+  )
+  const candidates = items
+    .filter((item) => (item.role === 'tool' || item.role === 'assistant')
+      && (item.tokens ?? 0) >= minTokens
+      && !protectedSeqs.has(item.seq))
+    .sort((a, b) => (b.tokens ?? 0) - (a.tokens ?? 0))
+  const chosen = []
+  let estimatedFreedTokens = 0
+  for (const candidate of candidates) {
+    if (estimatedFreedTokens >= targetTokens) break
+    chosen.push(candidate.seq)
+    estimatedFreedTokens = estimatedFreedTokens + (candidate.tokens ?? 0)
+  }
+  return {
+    chosen,
+    candidates: candidates.map((item) => ({ seq: item.seq, role: item.role, tokens: item.tokens ?? 0 })),
+    estimatedFreedTokens,
+    meetsTarget: estimatedFreedTokens >= targetTokens,
+  }
 }
 
 /** Boundary turn/step for a tombstone: prefer the deleted nodes, then neighbors. */
@@ -277,7 +370,22 @@ export function isTombstoneKind(kind) {
 }
 
 /** Durable payload of an invisible replacement node. */
-export function tombstoneData(turn, step, id) {
+/**
+ * Durable payload of an invisible replacement node.
+ *
+ * `batchId` ties the tombstone to one auditable batch operation: the ledger
+ * record for that batch lists every tombstone it wrote, so an undo can name
+ * exactly the nodes one user action produced while the tombstone kind stays
+ * the only marker the restore planner relies on.
+ * @param turn - open turn coordinate; the node must match an open step.
+ * @param step - open step coordinate.
+ * @param id - fresh message id for the invisible node.
+ * @param batchId - optional batch identifier written into the source.
+ */
+export function tombstoneData(turn, step, id, batchId = undefined) {
+  const source = typeof batchId === 'string' && batchId.length > 0
+    ? { kind: TOMBSTONE_KIND, batchId }
+    : { kind: TOMBSTONE_KIND }
   return {
     turn,
     step,
@@ -285,7 +393,7 @@ export function tombstoneData(turn, step, id) {
       id,
       role: 'developer',
       content: [],
-      source: { kind: TOMBSTONE_KIND },
+      source,
     },
   }
 }
@@ -353,6 +461,9 @@ export function deletedFromSurface(events, bySeq) {
     }
     records.push({
       tombstoneSeq: event.seq,
+      batchId: typeof event.data?.message?.source?.batchId === 'string'
+        ? event.data.message.source.batchId
+        : undefined,
       targetSeqs: [...targets],
       count: targets.length,
       items: known.map((original) => ({
@@ -370,14 +481,16 @@ export function deletedFromSurface(events, bySeq) {
 /** Human-readable Host listing for a command or tool result. */
 export function formatList(items, deleted = [], pending = [], limit = 30) {
   const lines = []
+  const totalTokens = items.reduce((total, item) => total + (item.tokens ?? 0), 0)
   if (items.length === 0) {
     lines.push('当前模型上下文中没有可管理的消息。')
   } else {
     const shown = items.length > limit ? items.slice(-limit) : items
     const omitted = items.length - shown.length
-    lines.push(`当前模型上下文中共 ${items.length} 条可管理消息${omitted > 0 ? `，仅显示最近 ${shown.length} 条` : ''}：`)
+    lines.push(`当前模型上下文中共 ${items.length} 条可管理消息，估算占用约 ${totalTokens.toLocaleString('en-US')} tokens${omitted > 0 ? `，仅显示最近 ${shown.length} 条` : ''}：`)
     for (const item of shown) {
-      lines.push(`#${item.seq} [${item.role}] ${item.preview.length > 0 ? item.preview : '（空消息）'}`)
+      const tokensLabel = `≈${(item.tokens ?? 0).toLocaleString('en-US')} tok`
+      lines.push(`#${item.seq} [${item.role}] [${tokensLabel}] ${item.preview.length > 0 ? item.preview : '（空消息）'}`)
     }
     if (omitted > 0) lines.push(`（更早的 ${omitted} 条请在标题栏的“上下文管理”中查看。）`)
   }
@@ -402,8 +515,9 @@ export function formatList(items, deleted = [], pending = [], limit = 30) {
   }
   lines.push('', '删除：/ctxmgr delete <序号,...>')
   lines.push('整轮：/ctxmgr deleteturn <轮号,...>（list-turns 查看轮号）')
+  lines.push('清理：/ctxmgr clean <目标tokens>（自动挑选大体积工具/助手消息，保护用户消息与最近消息）')
   lines.push('恢复：/ctxmgr restore <删除记录序号,...>（也可在标题栏的上下文管理弹窗中操作）')
-  lines.push('删除只会从后续模型请求的上下文中移除该消息，原始会话日志与聊天记录仍会保留。')
+  lines.push('删除只会从后续模型请求的上下文中移除该消息，原始会话日志与聊天记录仍会保留。token 数为启发式估算（4 字符/token），中文与 JSON 内容会明显低估。')
   return lines.join('\n')
 }
 
@@ -430,7 +544,7 @@ export function isTombstone(event) {
  * @param events - current surface events, oldest first.
  * @param bySeq - full-log index, kept for signature symmetry with the other
  *   surface projections.
- * @returns turn descriptors: { turn, seqs, messages, preview }.
+ * @returns turn descriptors: { turn, seqs, messages, tokens, preview }.
  */
 export function turnsFromSurface(events, bySeq = new Map()) {
   const groups = new Map()
@@ -442,7 +556,7 @@ export function turnsFromSurface(events, bySeq = new Map()) {
     const message = messageOf(event)
     const role = roleOf(event)
     const preview = previewOf(message)
-    const group = groups.get(turn) ?? { turn, seqs: [], messages: [] }
+    const group = groups.get(turn) ?? { turn, seqs: [], messages: [], tokens: 0 }
     group.seqs.push(event.seq)
     group.messages.push({ seq: event.seq, role, preview })
     groups.set(turn, group)
@@ -454,6 +568,94 @@ export function turnsFromSurface(events, bySeq = new Map()) {
   return [...groups.values()].sort((a, b) => a.turn - b.turn)
 }
 
+/**
+ * Attach per-turn estimated token totals to turn descriptors.
+ * @param turns - descriptors from {@link turnsFromSurface}.
+ * @param items - display items from {@link itemsFromSurface} (tokens required);
+ *   each message is attributed to exactly one turn.
+ */
+export function addTurnTokens(turns, items) {
+  const byTurn = new Map()
+  for (const item of items) byTurn.set(item.turn, (byTurn.get(item.turn) ?? 0) + (item.tokens ?? 0))
+  for (const turn of turns) turn.tokens = byTurn.get(turn.turn) ?? 0
+  return turns
+}
+
+/**
+ * Ledger entries an undo request could mean, most specific match first.
+ *
+ * Undo reuses the restore path, so a batch qualifies whenever it recorded at
+ * least one tombstone and was either applied or durably queued. A full batch id
+ * wins outright; otherwise the id is treated as a prefix, and the caller must
+ * refuse an ambiguous prefix rather than silently undoing a guess.
+ * @param batches - ledger entries from the Host's batch scan, in log order.
+ * @param batchId - optional full id or prefix.
+ * @returns every qualifying entry matching the id (all of them when omitted).
+ */
+export function matchUndoBatches(batches, batchId = undefined) {
+  if (!Array.isArray(batches)) return []
+  const eligible = batches.filter((entry) => entry !== null && typeof entry === 'object'
+    && entry.op !== 'undo'
+    && Array.isArray(entry.tombstoneSeqs) && entry.tombstoneSeqs.length > 0
+    && (entry.result === 'applied' || entry.result === 'queued'))
+  if (typeof batchId !== 'string' || batchId.length === 0) return eligible
+  const exact = eligible.filter((entry) => entry.batchId === batchId)
+  if (exact.length > 0) return exact
+  return eligible.filter((entry) => typeof entry.batchId === 'string'
+    && entry.batchId.startsWith(batchId))
+}
+
+/**
+ * Choose the batch an undo request targets: a named batch (id or unambiguous
+ * prefix), or the most recent batch that still has tombstones worth restoring.
+ * @param batches - ledger entries from the Host's batch scan, in log order.
+ * @param batchId - optional full id or unambiguous prefix.
+ * @returns the chosen ledger entry, or undefined when nothing qualifies.
+ */
+export function pickUndoBatch(batches, batchId = undefined) {
+  const matches = matchUndoBatches(batches, batchId)
+  if (matches.length === 0) return undefined
+  if (typeof batchId === 'string' && batchId.length > 0) {
+    return matches.length === 1 ? matches[0] : undefined
+  }
+  return matches[matches.length - 1]
+}
+
+/** Human-readable audit trail for the batch ledger. */
+export function formatBatches(batches, limit = 20) {
+  if (!Array.isArray(batches) || batches.length === 0) {
+    return [
+      '还没有操作台账：每次删除、整轮删除或按预算清理都会记一条。',
+      '',
+      '撤销最近一次：/ctxmgr undo-batch（有台账后可用）',
+    ].join('\n')
+  }
+  // Clamp so limit=0 cannot accidentally mean "show everything".
+  const safeLimit = Math.max(1, Number.isSafeInteger(limit) ? limit : 20)
+  const shown = batches.length > safeLimit ? batches.slice(-safeLimit) : batches
+  const lines = [`操作台账（共 ${batches.length} 条，显示最近 ${shown.length} 条）：`]
+  for (const entry of shown) {
+    const short = typeof entry.batchId === 'string' ? entry.batchId.slice(0, 8) : '未知'
+    const tokens = (Number.isSafeInteger(entry.estimatedFreedTokens) ? entry.estimatedFreedTokens : 0)
+      .toLocaleString('en-US')
+    const result = entry.result === 'applied'
+      ? '成功'
+      : entry.result === 'queued'
+        ? '排队中'
+        : entry.result === 'failed' ? '失败' : '跳过'
+    // Prefer the message count when the Host recorded it: one batch can remove
+    // more messages than it names as targets (a tool group travels together).
+    const count = Number.isSafeInteger(entry.count) && entry.count > 0
+      ? entry.count
+      : Array.isArray(entry.seqs) ? entry.seqs.length : 0
+    const reason = typeof entry.reason === 'string' && entry.reason.length > 0 ? `（${entry.reason}）` : ''
+    lines.push(`#${entry.recordSeq} ${short} · ${entry.op} · ${count} 条消息 · ≈${tokens} tok · ${result}${reason}`)
+  }
+  lines.push('', '撤销最近一次：/ctxmgr undo-batch',
+    '撤销指定批次：/ctxmgr undo-batch <batchId 前几位>（台账里 “·” 前的 8 位）')
+  lines.push('台账与墓碑都写在会话日志里，只增不改，重启后仍可查。')
+  return lines.join('\n')
+}
 /** Human-readable turn listing for a command or tool result. */
 export function formatTurns(turns, limit = 50) {
   if (turns.length === 0) return '当前上下文中没有可删除的对话轮。'
@@ -462,7 +664,8 @@ export function formatTurns(turns, limit = 50) {
   const lines = [`当前上下文中共 ${turns.length} 轮对话${omitted > 0 ? `，仅显示最近 ${shown.length} 轮` : ''}：`]
   for (const turn of shown) {
     const mark = turn.inProgress ? '（进行中，删除将在下一回合生效）' : ''
-    lines.push(`T${turn.turn} · ${turn.preview.length > 0 ? turn.preview : '（无用户提问）'} · ${turn.messages.length} 条${mark}`)
+    const tokensLabel = ` · ≈${(turn.tokens ?? 0).toLocaleString('en-US')} tok`
+    lines.push(`T${turn.turn} · ${turn.preview.length > 0 ? turn.preview : '（无用户提问）'} · ${turn.messages.length} 条${tokensLabel}${mark}`)
   }
   lines.push('', '删除整轮：/ctxmgr deleteturn <轮号,...>')
   lines.push('整轮删除会一并移除该轮的上下文注入；恢复仍按单条删除记录粒度进行。')
