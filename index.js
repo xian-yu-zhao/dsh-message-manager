@@ -35,7 +35,6 @@ import {
   deletedFromSurface,
   formatBatches,
   matchUndoBatches,
-  pickUndoBatch,
   foldSurface,
   formatList,
   formatTurns,
@@ -248,8 +247,11 @@ function durableQueue(ctx, session) {
     cache = new Map()
     queueCaches.set(ctx, cache)
   }
-  const state = cache.get(session.id) ?? { checkedTo: -1, pending: new Map() }
-  const events = session.snapshotEvents(Math.max(0, state.checkedTo + 1))
+  // `snapshotEvents(n)` consumes n already-read EVENTS, not seq N: keep a consumed
+  // count (the same projection the agent loop uses) so the window can never land
+  // past the end of the log and silently skip records.
+  const state = cache.get(session.id) ?? { checkedCount: 0, pending: new Map() }
+  const events = session.snapshotEvents(state.checkedCount)
   for (const event of events) {
     const record = pluginRecordOf(event)
     if (record === undefined) continue
@@ -270,7 +272,7 @@ function durableQueue(ctx, session) {
       }
     }
   }
-  if (events.length > 0) state.checkedTo = events[events.length - 1].seq
+  if (events.length > 0) state.checkedCount += events.length
   cache.set(session.id, state)
   return [...state.pending.values()]
 }
@@ -307,31 +309,29 @@ function appendBatchLedger(session, entry) {
   })
 }
 
-/** Per-plugin-instance batch ledger scan state, keyed by ctx then session id. */
-const batchCaches = new WeakMap()
-
 /**
- * Batch ledger entries in log order, incrementally.
+ * Batch ledger entries in log order.
  *
  * The ledger is a plugin record inside the append-only session log, so the
  * audit trail travels with the session, survives restarts, and never rewrites
  * a past record. Each record carries the batch id, the target seqs, the
  * tombstones it wrote, the estimated relief, and the outcome.
+ *
+ * The whole log is rescanned on every call: `snapshotEvents(n)` takes a log
+ * OFFSET, not a seq, so an incremental "scan from seq N" cursor silently
+ * reads an empty window when N and the remaining count disagree. The ledger
+ * is only read by a user-invoked command, and one pass over the in-memory log
+ * is cheap, so correctness wins over a cursor here.
  */
 function batchesFromLog(ctx, session) {
-  let cache = batchCaches.get(ctx)
-  if (cache === undefined) {
-    cache = new Map()
-    batchCaches.set(ctx, cache)
-  }
-  const state = cache.get(session.id) ?? { checkedTo: -1, entries: [] }
-  const events = session.snapshotEvents(Math.max(0, state.checkedTo + 1))
+  const entries = []
+  const events = session.snapshotEvents()
   for (const event of events) {
     const record = pluginRecordOf(event)
     if (record === undefined || record.type !== BATCH_TYPE) continue
     const data = record.data ?? {}
     if (typeof data.batchId !== 'string') continue
-    state.entries.push({
+    entries.push({
       recordSeq: record.seq,
       time: event.time,
       batchId: data.batchId,
@@ -344,9 +344,7 @@ function batchesFromLog(ctx, session) {
       reason: typeof data.reason === 'string' ? data.reason : undefined,
     })
   }
-  if (events.length > 0) state.checkedTo = events[events.length - 1].seq
-  cache.set(session.id, state)
-  return state.entries
+  return entries
 }
 
 /** List the audit ledger for one live session. */
@@ -455,11 +453,25 @@ async function undoBatch(ctx, agent, batchId) {
   if (isNamed && matches.length > 1 && !matches.some((entry) => entry.batchId === batchId)) {
     throw new Error(`批次前缀有歧义（匹配 ${matches.length} 条），请给更长的前缀或完整 batchId（/ctxmgr batches 查看台账）。`)
   }
-  const target = pickUndoBatch(batches, batchId)
+  // A batch counts as already undone when an undo ledger entry names it, or when
+  // none of its tombstones is on the surface any more. The ledger signal matters:
+  // a queued restore only lands on the next request, so back-to-back tool calls
+  // can still see the tombstone while the undo is already recorded.
+  const undoneIds = new Set(batches
+    .filter((entry) => entry.op === 'undo' && typeof entry.reason === 'string')
+    .map((entry) => entry.reason))
+  const stillOnSurface = matches.filter((entry) => !undoneIds.has(entry.batchId)
+    && entry.tombstoneSeqs.some((seq) => session.surface.nodes.includes(seq)))
+  const target = stillOnSurface.length === 0
+    ? undefined
+    : isNamed
+      ? stillOnSurface.find((entry) => entry.batchId === batchId)
+        ?? stillOnSurface.find((entry) => entry.batchId.startsWith(batchId))
+      : stillOnSurface[stillOnSurface.length - 1]
   if (target === undefined) {
     throw new Error(typeof batchId === 'string' && batchId.length > 0
       ? '找不到该批次记录（/ctxmgr batches 查看台账）。'
-      : '还没有可撤销的批次记录（台账为空，或只有恢复类操作）。')
+      : '还没有可撤销的批次记录（台账为空、这些批次都已撤销，或只有恢复类操作）。')
   }
   const restoreSeqs = target.tombstoneSeqs.filter((seq) => session.surface.nodes.includes(seq))
   if (restoreSeqs.length === 0) throw new Error('该批次已没有仍在表面的删除记录（可能已恢复过）。')

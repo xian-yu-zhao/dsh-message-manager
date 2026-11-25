@@ -3,7 +3,7 @@
 一个 DSH（DeepSeek Harness）插件：在会话标题栏增加「上下文管理」入口，管理会话的**模型上下文**——按条删、按整轮删，之后还能恢复。原始会话日志、聊天记录与审计数据始终保留。
 
 - 包名：`dsh-context-manager`
-- 版本：`1.7.0`
+- 版本：`1.7.1`
 - 类型：Cordis bundle（Host 半 + Web Client 半），纯 JavaScript，**无构建、无第三方依赖**
 - 适用：DSH `0.2.1-rc.2` 及以上（`0.2.2-rc.5` 实测）
 
@@ -15,14 +15,14 @@
 
 | 来源 | target 写法 | 说明 |
 |---|---|---|
-| npm | `dsh-context-manager@1.7.0` | 已发布到 [npm](https://www.npmjs.com/package/dsh-context-manager) |
+| npm | `dsh-context-manager@1.7.1` | 已发布到 [npm](https://www.npmjs.com/package/dsh-context-manager) |
 | GitHub | `github:xian-yu-zhao/dsh-context-manager` | 免 npm，直接从仓库取 |
-| 本地 tgz | `file:C:\path\to\dsh-context-manager-1.7.0.tgz` | Release 资产或 `npm pack` 产物 |
+| 本地 tgz | `file:C:\path\to\dsh-context-manager-1.7.1.tgz` | Release 资产或 `npm pack` 产物 |
 | 本地目录 | `link:C:\path\to\dsh-context-manager` | 开发调试用，改源码即生效 |
 
 安装后刷新 Web 页面（F5）或重启应用，会话标题栏右侧会出现列表图标。
 
-> **旧包已弃用**：`dsh-message-manager`（1.5.0）已在 npm 上标记 deprecated 并指向本包，GitHub 旧仓库 `xian-yu-zhao/dsh-message-manager` 自动重定向到 [`xian-yu-zhao/dsh-context-manager`](https://github.com/xian-yu-zhao/dsh-context-manager)。迁移只需两步：`plugin_manager remove_bundle target=dsh-message-manager`，再 `plugin_manager install_bundle target=dsh-context-manager@1.7.0`——新版本仍能识别旧版写入会话日志的删除记录与排队记录。
+> **旧包已弃用**：`dsh-message-manager`（1.5.0）已在 npm 上标记 deprecated 并指向本包，GitHub 旧仓库 `xian-yu-zhao/dsh-message-manager` 自动重定向到 [`xian-yu-zhao/dsh-context-manager`](https://github.com/xian-yu-zhao/dsh-context-manager)。迁移只需两步：`plugin_manager remove_bundle target=dsh-message-manager`，再 `plugin_manager install_bundle target=dsh-context-manager@1.7.1`——新版本仍能识别旧版写入会话日志的删除记录与排队记录。
 
 > 无 npm CLI 也能装：GitHub / tgz / 本地目录三种来源都不经过 npm 发布。
 >

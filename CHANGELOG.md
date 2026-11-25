@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.7.1
+
+- 修复：操作台账（`/ctxmgr batches`）在个别时刻读成空台账。根因是把日志事件序号当成「已消费事件数」传给 `snapshotEvents(n)`，窗口可能落到日志末尾之外；台账现在每次全量扫描会话日志（只由用户命令触发，成本可忽略）。
+- 修复：持久队列（删除/恢复的排队重放）使用同一错误游标，改为按「已消费事件数」推进——与 agent-loop 的 `storedCount` 写法一致，不再有跳过记录的窗口。
+- 修复：`/ctxmgr undo-batch` 可能重复选中「已经撤销过」的批次（撤销是排队到下个请求才落地，连调工具时墓碑仍在表面上）。现在同时看台账信号：某批次已被一条 `op=undo` 记录点名即视为已撤销，再撤销会明确报「还没有可撤销的批次记录」。
 ## 1.7.0
 
 - Token metering: `core.js` gains `estimateMessageTokens`, a heuristic priced like DSH's own `dsh-token-meter` (4 characters ≈ 1 token, +4 per content block, +4 role overhead per message). The message list shows `≈N tok` per message and the current total context occupation; delete, whole-turn delete and clean results report the estimated tokens released. These are estimates only — Chinese text and JSON are markedly underestimated.
