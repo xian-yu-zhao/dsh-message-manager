@@ -21,3 +21,12 @@
 - 局部压缩：`/ctxmgr compact <起序号> <止序号>`（工具 `context_manager` + `action=compact`，参数 `start` / `end`）调用官方 `ctx.compaction.compactRegion(start, end, agentCtx, signal)`。start / end 是表面位置序号，不是数值大小顺序，两端必须工具配对平衡，否则引擎报 unbalanced。
 - 它只作用于用户选区，不做全局阈值压缩；需要环境加载压缩后端（如 `dsh-compaction-basic`），没加载时给明确中文提示并把失败写进台账。服务通过 `ctx.get('compaction')` 可选获取，插件不硬依赖；成功与失败都会在台账留一条 `op: 'compact'` 记录（含被遮蔽的节点数与 tokens）。与 delete / clean 的区别：delete / clean 是移出上下文、可恢复且无摘要，compact 是把一段换成一条官方摘要、不能按消息恢复，但原始会话日志仍只增不改。
 - 旧墓碑没有 `batchId` / `recall` 也照常工作；弹窗「已删除」行在拿不到原文时，用召回指针显示「可召回 #seq · 摘要」。
+
+- 表面替换与生效时机：删除是追加一条空 developer 消息，墓碑投影成空消息，会话日志只增不改、可重放。目标属于更早步骤且当前有步骤打开时，立即从模型上下文移除；会话空闲或目标含进行中步骤时，写入 `plugin:context-manager/pending` 记录，在下一个 `agent/request` 组装前应用——也就是「下次发消息时它就不在上下文里了」。恢复总是排队。
+- 幂等与兼容：队列存在会话日志里，重启不丢；应用完追加 `plugin:context-manager/ack`，绝不重放两次；目标已消失则以 `skipped` 收尾。旧版 `dsh-message-manager` 写入的墓碑（`kind: message-manager`）与排队记录（`plugin:message-manager/pending` / `ack`）仍被识别，升级无需清理日志。整轮删除拆成逐个节点（或工具组）的独立墓碑，每条保有自己的恢复语义，已有墓碑不被覆盖。
+
+- 台账字段（记录 `plugin:context-manager/batch`，只增不改、重启不丢、不写外部文件）：`batchId`（撤销记录同样带）、`op`（`delete` / `delete-turn` / `clean` / `compact` / `undo`）、`seqs`（消息序号或轮号）、`tombstoneSeqs`（实际写入）、`estimatedFreedTokens`（启发式估算）、`result`（`applied` / `queued` / `skipped` / `failed`）、`reason`。批次号也写进墓碑 `source`：`{ kind: 'context-manager', batchId: '<uuid>', recall: [...] }`；`kind` 仍是唯一标记，旧墓碑没有这些字段也照常工作。
+
+- 恢复能力边界：用户消息与普通上下文消息恢复到原表面位置；助手纯文本消息追加到会话末尾（DSH 不允许 assistant 消息作为带 source 引用的表面替换）；助手工具调用组整组追加到末尾以保持合法工具生命周期；单独的工具结果、带工具变更的上下文消息、系统提示词不支持恢复。恢复助手消息会在聊天记录末尾新增内容副本，原删除记录仍留在日志里。
+
+- 行为限制：被删消息仍出现在聊天记录里（聊天视图展示历史，弹窗与后续模型请求用当前表面）；系统提示词与尚未落盘的消息（如正在流式生成）不可删；墓碑本身不能再当消息删除，请改用 `restore`，`foldSurface` 会忽略缺 `seq` 的畸形表面对象；需要会话处于运行状态；关闭插件后标题栏入口、`/ctxmgr` 与工具消失，但已写入的删除记录保留；纯本地运行，不联网、不外发数据。
