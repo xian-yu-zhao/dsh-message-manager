@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.7.3
+
+- 文档：README 按 `dsh-plugin-readme` 规范重写为**英文主文 + 中文说明**，结构改为 Why / Install / Requirements / Advantages / Use cases / Tools & Commands / Boundaries & limitations / Deep mechanics / Changelog；旧的整篇中文长文不再保留。
+- 文档：文件结构、开发与测试、发布流程、插件市场收录移到新的 `CONTRIBUTING.md`（维护者向）。
+- 文档：`docs/DETAIL.md` / `docs/DETAIL.zh.md` 补齐五节——表面替换与生效时机、幂等与旧数据兼容、审计台账字段、恢复的能力边界、行为与限制。
+- 无代码变更，功能与 1.7.2 完全一致。
+
 ## 1.7.2
 
 - 修复：局部压缩遇到「边界不是整步边界」时，原本会把引擎的英文异常原文透出（`compactRegion: end seq N is not a balanced boundary ...`）。现在翻成中文并给出可执行的建议（换成已结束步骤的首/末条消息序号）。
