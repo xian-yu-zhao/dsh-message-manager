@@ -1,5 +1,5 @@
 /**
- * Host half of the Session Message Manager.
+ * Host half of the Session Context Manager.
  *
  * A surface replacement whose replacement event derives no model message is the
  * supported way to remove one conversation entry from later model requests: the
@@ -9,13 +9,13 @@
  * Session format validation requires every `developer/message` to match an open
  * turn and step, and a Session cannot append from inside its own `session/event`
  * dispatch. A deletion or restore that cannot run safely right now is therefore
- * recorded as a durable `plugin:message-manager/pending` record — plugin records
+ * recorded as a durable `plugin:context-manager/pending` record — plugin records
  * append without an open turn/step and travel with the log across restarts —
  * and replayed on the owning Agent's `agent/request` waterfall. That hook runs
  * after `step/start` (so the step is open and appending is allowed) and before
  * the request messages are derived, so the next request already reflects it.
  * Every replay is idempotent: an applied record is acknowledged with a
- * `plugin:message-manager/ack` record, and a replayed operation whose target
+ * `plugin:context-manager/ack` record, and a replayed operation whose target
  * vanished is acknowledged as skipped instead of being retried forever.
  *
  * Restore reverses a tombstone:
@@ -35,6 +35,7 @@ import {
   formatList,
   formatTurns,
   hasToolChange,
+  isTombstoneKind,
   itemsFromSurface,
   planDeletion,
   tombstoneData,
@@ -58,27 +59,29 @@ try {
 } catch {
   const runtimeDir = process.argv[2]
   if (typeof runtimeDir !== 'string' || runtimeDir.length === 0) {
-    throw new Error('message-manager 无法加载 @deepseek-ai/dsh-session：裸导入失败，且当前进程不是携带运行时目录的桌面 Host。')
+    throw new Error('context-manager 无法加载 @deepseek-ai/dsh-session：裸导入失败，且当前进程不是携带运行时目录的桌面 Host。')
   }
   sessionCore = await import(pathToFileURL(join(runtimeDir, 'node_modules', '@deepseek-ai', 'dsh-session', 'lib', 'index.js')).href)
 }
 const { appendPluginRecord, pluginRecordOf } = sessionCore
 
-export const name = 'message-manager'
+export const name = 'context-manager'
 
 export const inject = ['sessions', 'agents', 'commands', 'tools']
 
-const TOMBSTONE_SOURCE = 'message-manager'
 const RESTORED_PREFIX = 'restored-assistant-'
-const PENDING_TYPE = 'plugin:message-manager/pending'
-const ACK_TYPE = 'plugin:message-manager/ack'
+const PENDING_TYPE = 'plugin:context-manager/pending'
+const ACK_TYPE = 'plugin:context-manager/ack'
+/** Queue record types older releases wrote; still applied after an upgrade. */
+const LEGACY_PENDING_TYPES = ['plugin:message-manager/pending']
+const LEGACY_ACK_TYPES = ['plugin:message-manager/ack']
 /** Messages that mean a replayed operation already happened; ack as skipped. */
 const IDEMPOTENT_MARKERS = ['已不在当前表面', '已经恢复', '已不在会话日志']
 
 /** Resolve the live Session behind one command/tool agent. */
 function liveSession(ctx, agent) {
   if (agent === undefined || agent === null || typeof agent.id !== 'string') {
-    throw new Error('消息管理需要一个会话作用域。')
+    throw new Error('上下文管理需要一个会话作用域。')
   }
   const session = ctx.sessions.get(agent.id)
   if (session === undefined) throw new Error('当前会话未处于运行状态，无法读取或修改消息上下文。')
@@ -179,14 +182,14 @@ function appendTombstones(session, runs, turn, step) {
   return tombstoneSeqs
 }
 
-/** Whether one event is an empty message-manager tombstone. */
+/** Whether one event is an empty context-manager tombstone, current or legacy kind. */
 function isTombstone(event) {
   return event !== undefined
     && event !== null
     && event.type === 'developer/message'
     && Array.isArray(event.data?.message?.content)
     && event.data.message.content.length === 0
-    && event.data?.message?.source?.kind === TOMBSTONE_SOURCE
+    && isTombstoneKind(event.data?.message?.source?.kind)
     && event.surfaceOp !== null
     && typeof event.surfaceOp === 'object'
     && event.surfaceOp.op === 'replace'
@@ -222,10 +225,10 @@ function durableQueue(ctx, session) {
   for (const event of events) {
     const record = pluginRecordOf(event)
     if (record === undefined) continue
-    if (record.type === ACK_TYPE) {
+    if (record.type === ACK_TYPE || LEGACY_ACK_TYPES.includes(record.type)) {
       const pendingSeq = record.data?.pendingSeq
       if (Number.isSafeInteger(pendingSeq)) state.pending.delete(pendingSeq)
-    } else if (record.type === PENDING_TYPE) {
+    } else if (record.type === PENDING_TYPE || LEGACY_PENDING_TYPES.includes(record.type)) {
       const op = record.data?.op
       const targetSeq = record.data?.targetSeq
       if ((op === 'delete' || op === 'restore' || op === 'delete-turn') && Number.isSafeInteger(targetSeq)) {
@@ -673,7 +676,7 @@ function applyQueuedOperations(ctx, agent, turn, step) {
       const result = IDEMPOTENT_MARKERS.some((marker) => message.includes(marker)) ? 'skipped' : 'failed'
       appendAck(session, entry.recordSeq, result, message)
       if (result === 'failed') {
-        ctx.logger?.warn?.(`message-manager: queued ${entry.op} ${entry.targetSeq} failed: ${message}`)
+        ctx.logger?.warn?.(`context-manager: queued ${entry.op} ${entry.targetSeq} failed: ${message}`)
       }
     }
   }
@@ -703,7 +706,7 @@ function ensureAgentListener(ctx, agent) {
     ? owner.effect(() => () => {
       stop()
       agentListeners.delete(id)
-    }, 'message-manager: queued operations')
+    }, 'context-manager: queued operations')
     : () => {
       stop()
       agentListeners.delete(id)
@@ -712,7 +715,7 @@ function ensureAgentListener(ctx, agent) {
   return true
 }
 
-/** Parse `/msgmgr` input into an operation. */
+/** Parse `/ctxmgr` input into an operation. */
 function parseCommand(rawInput) {
   const text = typeof rawInput === 'string' ? rawInput.trim() : ''
   if (text.length === 0) return { op: 'list' }
@@ -741,7 +744,7 @@ export function apply(ctx) {
   })
 
   const command = ctx.commands.register({
-    name: 'msgmgr',
+    name: 'ctxmgr',
     description: '列出、批量删除或恢复当前会话中的单条消息，并按轮删除整轮对话（仅移出/恢复模型上下文，保留原始日志）。',
     input: { hint: 'list | turns | delete <序号,...> | deleteturn <轮号,...> | restore <删除记录序号,...>' },
     recordInput: false,
@@ -768,7 +771,7 @@ export function apply(ctx) {
           const result = await restoreMessages(ctx, invocation.agent, parsed.seqs)
           return { kind: 'success', text: result.text }
         }
-        return { kind: 'error', text: `${parsed.reason} 用法：/msgmgr list | /msgmgr turns | /msgmgr delete <序号,...> | /msgmgr deleteturn <轮号,...> | /msgmgr restore <删除记录序号,...>` }
+        return { kind: 'error', text: `${parsed.reason} 用法：/ctxmgr list | /ctxmgr turns | /ctxmgr delete <序号,...> | /ctxmgr deleteturn <轮号,...> | /ctxmgr restore <删除记录序号,...>` }
       } catch (error) {
         return { kind: 'error', text: error instanceof Error ? error.message : String(error) }
       }
@@ -776,8 +779,8 @@ export function apply(ctx) {
   })
 
   const tool = ctx.tools.register({
-    name: 'message_manager',
-    description: 'Manage the model context of the current session. Actions: list (current messages plus deleted records and queued operations), list-turns (conversation turns with turn numbers), delete (message seqs; any tool results tied to an assistant message that calls tools go with it), delete-turns (whole turns: the user prompt, the assistant work and reply, and that turn\'s injected context), restore (tombstone seqs from list; user/context restores at its original position, assistant content is appended at the tail). Deletion only affects later model requests; the raw session log and chat transcript are retained. Operations that cannot run safely yet are recorded durably in the session log and applied when the next step starts, surviving restarts. Use only when the user explicitly asks. Requires a live session.',
+    name: 'context_manager',
+    description: 'Manage the model context of the current session. Actions: list (current messages plus deleted records and queued operations), list-turns (conversation turns with turn numbers), delete (message seqs; any tool results tied to an assistant message that calls tools go with it), delete-turns (whole turns: the user prompt, the assistant work and reply, and that turn\'s injected context), restore (tombstone seqs from list; user/context restores at its original position, assistant content is appended at the tail). Typical uses: roll back to the start of a turn by deleting that turn and the ones after it, or drop noisy messages that no longer matter. Deletion only affects later model requests; the raw session log and chat transcript are retained. Operations that cannot run safely yet are recorded durably in the session log and applied when the next step starts, surviving restarts. Use only when the user explicitly asks. Requires a live session.',
     parameters: {
       type: 'object',
       properties: {
@@ -855,5 +858,5 @@ export function apply(ctx) {
       entry.disposeOwnerEffect()
     }
     agentListeners.clear()
-  }, 'message-manager: command, tool, and queued operations')
+  }, 'context-manager: command, tool, and queued operations')
 }

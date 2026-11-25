@@ -1,9 +1,9 @@
-# 会话消息管理 · dsh-message-manager
+# 会话上下文管理 · dsh-context-manager
 
-一个 DSH（DeepSeek Harness）插件：在会话标题栏增加「消息管理」入口，把不需要的消息**从模型上下文中移除**——单条删、整轮删、批量删，之后还能恢复。原始会话日志、聊天记录与审计数据始终保留。
+一个 DSH（DeepSeek Harness）插件：在会话标题栏增加「上下文管理」入口，管理会话的**模型上下文**——按条删、按整轮删，之后还能恢复。原始会话日志、聊天记录与审计数据始终保留。
 
-- 包名：`dsh-message-manager`
-- 版本：`1.5.0`
+- 包名：`dsh-context-manager`
+- 版本：`1.6.0`
 - 类型：Cordis bundle（Host 半 + Web Client 半），纯 JavaScript，**无构建、无第三方依赖**
 - 适用：DSH `0.2.1-rc.2` 及以上（`0.2.2-rc.5` 实测）
 
@@ -15,16 +15,52 @@
 
 | 来源 | target 写法 | 说明 |
 |---|---|---|
-| npm | `dsh-message-manager@1.5.0` | 已发布到 [npm](https://www.npmjs.com/package/dsh-message-manager) |
-| GitHub | `github:xian-yu-zhao/dsh-message-manager` | 免 npm，直接从仓库取 |
-| 本地 tgz | `file:C:\path\to\dsh-message-manager-1.5.0.tgz` | Release 资产或 `npm pack` 产物 |
-| 本地目录 | `link:C:\path\to\dsh-message-manager` | 开发调试用，改源码即生效 |
+| npm | `dsh-context-manager@1.6.0` | 已发布到 [npm](https://www.npmjs.com/package/dsh-context-manager) |
+| GitHub | `github:xian-yu-zhao/dsh-context-manager` | 免 npm，直接从仓库取 |
+| 本地 tgz | `file:C:\path\to\dsh-context-manager-1.6.0.tgz` | Release 资产或 `npm pack` 产物 |
+| 本地目录 | `link:C:\path\to\dsh-context-manager` | 开发调试用，改源码即生效 |
 
 安装后刷新 Web 页面（F5）或重启应用，会话标题栏右侧会出现列表图标。
+
+> **旧包已弃用**：`dsh-message-manager`（1.5.0）已在 npm 上标记 deprecated 并指向本包，GitHub 旧仓库 `xian-yu-zhao/dsh-message-manager` 自动重定向到 [`xian-yu-zhao/dsh-context-manager`](https://github.com/xian-yu-zhao/dsh-context-manager)。迁移只需两步：`plugin_manager remove_bundle target=dsh-message-manager`，再 `plugin_manager install_bundle target=dsh-context-manager@1.6.0`——新版本仍能识别旧版写入会话日志的删除记录与排队记录。
 
 > 无 npm CLI 也能装：GitHub / tgz / 本地目录三种来源都不经过 npm 发布。
 >
 > 若 npm 上暂时只能看到 `0.0.0-stage` 占位版本，说明 npm 的暂存审核尚未通过，此时请先用 GitHub 源安装。
+
+---
+
+## 使用场景
+
+### 回退到某一轮的开始，重新提问
+
+模型在某一轮改坏了文件，或者方向跑偏了。先用 `/ctxmgr turns` 看清轮号与预览，再用 `/ctxmgr deleteturn 5` 把第 5 轮（你的提问 + 它的全部工作与回答）整体移出上下文——上下文就回到第 5 轮开始前的状态，然后重新描述需求。想回到第 5 轮之前但保留第 5 轮之前的成果，就删掉它之后的所有轮次。
+
+`/ctxmgr turns` → `/ctxmgr deleteturn 5`
+
+### 清除废物信息，省下上下文
+
+几屏报错日志、一大段粘贴的代码、试错过程中的无效指令、啰嗦的工具输出，都会持续占用上下文预算。用 `/ctxmgr list` 找到序号，再按条清掉，后续请求不再携带这些内容。
+
+`/ctxmgr list` → `/ctxmgr delete 12,13,14`
+
+### 让模型忘掉过时的中间结论
+
+探索阶段达成的方案与结论，后来被推翻或替换了，留在上下文里容易被模型反复引用。删掉对应的轮次，只保留最终结论所在的轮。
+
+`/ctxmgr turns` → `/ctxmgr deleteturn 3,4`（工具等价：`context_manager` + `delete-turns`）
+
+### 收敛超长会话
+
+上下文快满，但又不想新开一个会话丢掉历史。把早期纯探索的轮次整轮删掉，保留关键决策轮次，后续请求就能继续在同一个会话里推进。
+
+`/ctxmgr turns` → `/ctxmgr deleteturn 2,3,4`
+
+### 误发内容的止损（如实说明边界）
+
+把密钥、隐私片段或发错的内容从**模型上下文**里移除，后续请求不再看到它们。但必须清楚：**原始会话日志与聊天记录仍在本地会话文件里**，这个插件不是擦除工具，真要抹掉请自行处理会话文件。
+
+`/ctxmgr delete 9`（工具等价：`context_manager` + `delete`）
 
 ---
 
@@ -36,20 +72,20 @@ DSH 的插件市场（**Plugins → Discover**）**没有官方索引**：它只
 
 1. 侧栏 **Plugins** → **Experimental plugins** 打开 **Custom plugin indexes**，页面出现 **Installed / Discover** 两个标签。
 2. **Discover** → **Add index source**，填入索引地址（已配置过就跳过）。
-3. 搜索 `message manager`，安装按钮把索引里的 `name@version` 交给同一套 `installBundle`。
+3. 搜索 `context manager`，安装按钮把索引里的 `name@version` 交给同一套 `installBundle`。
 
-投稿收录：向 awesome-dsh-plugin 仓库提一个 PR，**只新增一个文件** `data/plugins/xian-yu-zhao__dsh-message-manager.yml`，内容即本仓库的 [`market/awesome-dsh-plugin.yml`](market/awesome-dsh-plugin.yml)：
+投稿收录：向 awesome-dsh-plugin 仓库提一个 PR，**只新增一个文件** `data/plugins/xian-yu-zhao__dsh-context-manager.yml`，内容即本仓库的 [`market/awesome-dsh-plugin.yml`](market/awesome-dsh-plugin.yml)：
 
 ```yaml
-url: https://github.com/xian-yu-zhao/dsh-message-manager
-name: xian-yu-zhao/dsh-message-manager
+url: https://github.com/xian-yu-zhao/dsh-context-manager
+name: xian-yu-zhao/dsh-context-manager
 category: session
 description:
-  en: 'Removes single messages or whole conversation turns from the model context of a DSH session, and can restore them later.'
-  zh: '从 DSH 会话的模型上下文中移除单条消息或整轮对话，之后可以恢复。'
+  en: 'Manages the model context of a DSH session: removes single messages or whole conversation turns (roll back to the start of a turn) and can restore them later.'
+  zh: '管理 DSH 会话的模型上下文：按条或按整轮移除消息（可回退到某一轮的开始），之后还能恢复。'
 ```
 
-合并后站点重建索引，即可被搜到并一键安装（安装来源为 npm 上的 `dsh-message-manager`）。门槛核对：`dsh.bundle` 已声明 ✅、有真实可用代码 ✅、仓库建满 1 天 ✅、`dsh-plugin` topic 已添加 ✅。
+合并后站点重建索引，即可被搜到并一键安装（安装来源为 npm 上的 `dsh-context-manager`）。门槛核对：`dsh.bundle` 已声明 ✅、有真实可用代码 ✅、仓库建满 1 天 ✅、`dsh-plugin` topic 已添加 ✅。
 
 ### 自己托管一份索引
 
@@ -61,10 +97,11 @@ description:
   "title": { "en": "xian-yu-zhao plugins", "zh": "xian-yu-zhao 插件" },
   "plugins": [
     {
-      "name": "dsh-message-manager",
-      "title": { "en": "Session message manager", "zh": "会话消息管理" },
+      "id": "context-manager",
+      "name": "dsh-context-manager",
+      "title": { "en": "Context manager", "zh": "会话上下文管理" },
       "versions": [
-        { "version": "1.5.0", "publishTimestamp": 1795534865, "source": { "type": "npm" } }
+        { "version": "1.6.0", "publishTimestamp": 1795534865, "source": { "type": "npm" } }
       ]
     }
   ]
@@ -79,7 +116,7 @@ description:
 
 ### 弹窗
 
-1. 打开任意会话，点标题栏右侧的列表图标，打开「消息管理」。
+1. 打开任意会话，点标题栏右侧的列表图标，打开「上下文管理」。
 2. **对话轮（整轮删除）**：一行一轮，显示轮号、预览与消息条数；勾选后点「删除选中」，或点行尾「删除本轮」。这一轮里的用户提问、助手的工作与回答、该轮注入的上下文会一起移出，不必逐条删工具调用。
 3. **当前消息**（默认折叠，点标题或 ▸ 展开）：按条勾选，点「删除选中」；也可点行尾垃圾桶单独删。折叠状态下全选与批量删除按钮仍可用。
 4. **已删除**：保留本插件产生的删除记录（`删除记录 #seq`），可勾选后「恢复选中」，或逐条「恢复」。
@@ -90,16 +127,16 @@ description:
 ### 命令
 
 ```text
-/msgmgr list                                  # 当前消息 + 已删除记录 + 排队中的操作
-/msgmgr turns                                 # 对话轮列表（轮号、预览、条数、进行中标记）
-/msgmgr delete <序号,...>                     # 按条删除
-/msgmgr deleteturn <轮号,...>                 # 按轮删除
-/msgmgr restore <删除记录序号,...>            # 恢复
+/ctxmgr list                                  # 当前消息 + 已删除记录 + 排队中的操作
+/ctxmgr turns                                 # 对话轮列表（轮号、预览、条数、进行中标记）
+/ctxmgr delete <序号,...>                     # 按条删除
+/ctxmgr deleteturn <轮号,...>                 # 按轮删除
+/ctxmgr restore <删除记录序号,...>            # 恢复
 ```
 
 ### 工具
 
-模型可调用 `message_manager`，参数 `action` ∈ `list` / `list-turns` / `delete` / `delete-turns` / `restore`，`seqs` 按 action 解释为消息序号、轮号或删除记录序号。工具描述里明确要求「仅在用户明确要求时使用」。
+模型可调用 `context_manager`，参数 `action` ∈ `list` / `list-turns` / `delete` / `delete-turns` / `restore`，`seqs` 按 action 解释为消息序号、轮号或删除记录序号。工具描述里明确要求「仅在用户明确要求时使用」。
 
 ---
 
@@ -108,9 +145,10 @@ description:
 DSH 的会话格式要求 `developer/message` 必须位于一个已打开的 turn/step 中，且 Session 不能在 `session/event` 派发过程中重入追加。插件据此选路：
 
 - **目标属于更早的步骤，且当前有步骤打开**：立即从模型上下文移除。
-- **会话空闲，或目标包含当前正在进行的步骤**：进入**持久化队列**——一条 `plugin:message-manager/pending` 记录直接写进会话日志（plugin 记录不要求打开的 turn/step），在下一个 `agent/request` 时、模型请求组装之前同步应用。也就是「你下次发消息时它就不在上下文里了」。
+- **会话空闲，或目标包含当前正在进行的步骤**：进入**持久化队列**——一条 `plugin:context-manager/pending` 记录直接写进会话日志（plugin 记录不要求打开的 turn/step），在下一个 `agent/request` 时、模型请求组装之前同步应用。也就是「你下次发消息时它就不在上下文里了」。
 - **恢复**：总是进队列，在下一个 `agent/request` 时应用。
-- 队列存在会话日志里，重启不丢；应用完的操作追加 `plugin:message-manager/ack` 记录，**绝不重放两次**；重放时目标已消失则以 skipped 收尾，不反复报错。
+- 队列存在会话日志里，重启不丢；应用完的操作追加 `plugin:context-manager/ack` 记录，**绝不重放两次**；重放时目标已消失则以 skipped 收尾，不反复报错。
+- **兼容旧数据**：旧版 `dsh-message-manager` 写入会话日志的删除记录（tombstone 来源 kind `message-manager`）与排队记录（旧名 `plugin:message-manager/pending` / `plugin:message-manager/ack`）仍会被识别、恢复与应用，升级无需手工清理日志。
 - 整轮删除拆成逐个节点（或工具调用组）的独立删除记录，每条仍保有自己的恢复语义；表面上已有的删除记录不会被覆盖。
 
 ---
@@ -135,7 +173,7 @@ DSH 的会话格式要求 `developer/message` 必须位于一个已打开的 tur
 - 系统提示词、尚未落盘的消息（例如正在流式生成的消息）不在可删除范围内。
 - 需要会话处于运行状态。
 - 纯本地运行：不联网、不外发任何数据。
-- 关闭插件后标题栏入口、`/msgmgr` 命令与 `message_manager` 工具都会消失；已写入日志的删除记录仍然保留。
+- 关闭插件后标题栏入口、`/ctxmgr` 命令与 `context_manager` 工具都会消失；已写入日志的删除记录仍然保留。
 
 ---
 
@@ -143,9 +181,9 @@ DSH 的会话格式要求 `developer/message` 必须位于一个已打开的 tur
 
 | 文件 | 作用 |
 |---|---|
-| `index.js` | Host 半：`/msgmgr` 命令、`message_manager` 工具、删除/恢复计划、持久化队列与 `agent/request` 应用器 |
+| `index.js` | Host 半：`/ctxmgr` 命令、`context_manager` 工具、删除/恢复计划、持久化队列与 `agent/request` 应用器 |
 | `core.js` | 纯函数：表面折叠、删除计划、墓碑消息、列表与对话轮格式化 |
-| `client.js` | Client 半：标题栏按钮、「消息管理」弹窗（对话轮 / 当前消息 / 已删除） |
+| `client.js` | Client 半：标题栏按钮、「上下文管理」弹窗（对话轮 / 当前消息 / 已删除） |
 | `cordis.patch.yml` | 向 profile patch 插入一行插件 |
 | `locale/*.json` | 插件管理页与详情页的标题、描述、详情文档路径 |
 | `docs/DETAIL*.md`、`docs/preview.svg` | 插件详情页的单图说明 |
@@ -169,7 +207,7 @@ node --check core.js
 改 Client 半后需要刷新页面（F5）或重启应用；改 Host 半需重新安装 bundle：
 
 ```text
-plugin_manager remove_bundle   target=dsh-message-manager
+plugin_manager remove_bundle   target=dsh-context-manager
 plugin_manager install_bundle  target=link:<插件目录>
 ```
 
@@ -178,7 +216,7 @@ plugin_manager install_bundle  target=link:<插件目录>
 `publishConfig` 已锁定 `registry.npmjs.org` 与 `access: public`，`files` 已覆盖运行文件、locale、图标与 `docs/`：
 
 ```bash
-npm publish          # 发布 dsh-message-manager@<version>
+npm publish          # 发布 dsh-context-manager@<version>
 git push origin main
 ```
 

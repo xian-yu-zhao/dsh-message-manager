@@ -1,8 +1,8 @@
 {
-  "name": "dsh-message-manager",
-  "version": "1.5.0",
+  "name": "dsh-context-manager",
+  "version": "1.6.0",
   "type": "module",
-  "description": "Delete single messages or whole conversation turns from a DSH session's model context, and restore them later, without touching the raw session log.",
+  "description": "Manage a DSH session's model context: delete single messages or whole conversation turns (roll back to the start of any turn, drop noise), and restore them later, without touching the raw session log.",
   "license": "MIT",
   "author": "xian-yu-zhao",
   "keywords": [
@@ -12,19 +12,22 @@
     "cordis",
     "plugin",
     "session",
-    "message",
     "context",
+    "conversation",
+    "turn",
+    "rollback",
+    "prune",
     "tombstone",
     "delete",
     "restore"
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/xian-yu-zhao/dsh-message-manager.git"
+    "url": "git+https://github.com/xian-yu-zhao/dsh-context-manager.git"
   },
-  "homepage": "https://github.com/xian-yu-zhao/dsh-message-manager#readme",
+  "homepage": "https://github.com/xian-yu-zhao/dsh-context-manager#readme",
   "bugs": {
-    "url": "https://github.com/xian-yu-zhao/dsh-message-manager/issues"
+    "url": "https://github.com/xian-yu-zhao/dsh-context-manager/issues"
   },
   "publishConfig": {
     "access": "public",

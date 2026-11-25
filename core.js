@@ -266,6 +266,16 @@ export function planDeletion(events, targetSeq) {
   }
 }
 
+/** Source kind this plugin writes for its invisible tombstones. */
+export const TOMBSTONE_KIND = 'context-manager'
+/** Source kinds older releases wrote; their tombstones stay restorable. */
+export const LEGACY_TOMBSTONE_KINDS = Object.freeze(['message-manager'])
+
+/** Whether one message source kind belongs to this plugin, current or legacy. */
+export function isTombstoneKind(kind) {
+  return kind === TOMBSTONE_KIND || LEGACY_TOMBSTONE_KINDS.includes(kind)
+}
+
 /** Durable payload of an invisible replacement node. */
 export function tombstoneData(turn, step, id) {
   return {
@@ -275,7 +285,7 @@ export function tombstoneData(turn, step, id) {
       id,
       role: 'developer',
       content: [],
-      source: { kind: 'message-manager' },
+      source: { kind: TOMBSTONE_KIND },
     },
   }
 }
@@ -309,7 +319,7 @@ export function deletedFromSurface(events, bySeq) {
   const records = []
   for (const event of events) {
     if (event === undefined || event === null || event.type !== 'developer/message') continue
-    if (event.data?.message?.source?.kind !== 'message-manager') continue
+    if (!isTombstoneKind(event.data?.message?.source?.kind)) continue
     const op = event.surfaceOp
     if (op === null || typeof op !== 'object' || op.op !== 'replace') continue
     if (restored.has(event.seq)) continue
@@ -369,7 +379,7 @@ export function formatList(items, deleted = [], pending = [], limit = 30) {
     for (const item of shown) {
       lines.push(`#${item.seq} [${item.role}] ${item.preview.length > 0 ? item.preview : '（空消息）'}`)
     }
-    if (omitted > 0) lines.push(`（更早的 ${omitted} 条请在标题栏的“消息管理”中查看。）`)
+    if (omitted > 0) lines.push(`（更早的 ${omitted} 条请在标题栏的“上下文管理”中查看。）`)
   }
   if (pending.length > 0) {
     lines.push('', `排队中（下一回合生效，共 ${pending.length} 项）：`)
@@ -390,21 +400,21 @@ export function formatList(items, deleted = [], pending = [], limit = 30) {
       lines.push(`#${record.tombstoneSeq} ← ${summary}（${note}）`)
     }
   }
-  lines.push('', '删除：/msgmgr delete <序号,...>')
-  lines.push('整轮：/msgmgr deleteturn <轮号,...>（list-turns 查看轮号）')
-  lines.push('恢复：/msgmgr restore <删除记录序号,...>（也可在标题栏的消息管理弹窗中操作）')
+  lines.push('', '删除：/ctxmgr delete <序号,...>')
+  lines.push('整轮：/ctxmgr deleteturn <轮号,...>（list-turns 查看轮号）')
+  lines.push('恢复：/ctxmgr restore <删除记录序号,...>（也可在标题栏的上下文管理弹窗中操作）')
   lines.push('删除只会从后续模型请求的上下文中移除该消息，原始会话日志与聊天记录仍会保留。')
   return lines.join('\n')
 }
 
-/** Whether one event is an empty message-manager tombstone. */
+/** Whether one event is an empty context-manager tombstone, current or legacy kind. */
 export function isTombstone(event) {
   return event !== undefined
     && event !== null
     && event.type === 'developer/message'
     && Array.isArray(event.data?.message?.content)
     && event.data.message.content.length === 0
-    && event.data?.message?.source?.kind === 'message-manager'
+    && isTombstoneKind(event.data?.message?.source?.kind)
     && event.surfaceOp !== null
     && typeof event.surfaceOp === 'object'
     && event.surfaceOp.op === 'replace'
@@ -454,7 +464,7 @@ export function formatTurns(turns, limit = 50) {
     const mark = turn.inProgress ? '（进行中，删除将在下一回合生效）' : ''
     lines.push(`T${turn.turn} · ${turn.preview.length > 0 ? turn.preview : '（无用户提问）'} · ${turn.messages.length} 条${mark}`)
   }
-  lines.push('', '删除整轮：/msgmgr deleteturn <轮号,...>')
+  lines.push('', '删除整轮：/ctxmgr deleteturn <轮号,...>')
   lines.push('整轮删除会一并移除该轮的上下文注入；恢复仍按单条删除记录粒度进行。')
   return lines.join('\n')
 }

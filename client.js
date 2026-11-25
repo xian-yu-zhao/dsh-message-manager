@@ -1,5 +1,5 @@
 /**
- * Client half of the Session Message Manager.
+ * Client half of the Session Context Manager.
  *
  * The header utility opens a frame-wide dialog listing the messages currently
  * loaded into the view. It folds surface replacements locally so a deleted row
@@ -7,13 +7,13 @@
  * that owns the authoritative surface rewrite.
  */
 window.__ModuleLoader__.load({
-  id: '@local/dsh-message-manager',
+  id: 'dsh-context-manager',
   factory(require) {
     const React = require('react')
     const h = React.createElement
     const { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } = React
 
-    const NS = 'message-manager'
+    const NS = 'context-manager'
     const SURFACE_TYPES = new Set([
       'system/message',
       'developer/message',
@@ -29,9 +29,9 @@ window.__ModuleLoader__.load({
     })
 
     const zh = {
-      open: '消息管理',
-      title: '消息管理',
-      subtitle: '管理当前会话的模型上下文，可删除其中的单条消息。',
+      open: '上下文管理',
+      title: '上下文管理',
+      subtitle: '管理当前会话的模型上下文：按条删除、按整轮删除，之后都能恢复。',
       close: '关闭',
       empty: '当前上下文没有可管理的消息。',
       notReady: '会话尚未就绪，请稍后再试。',
@@ -52,7 +52,7 @@ window.__ModuleLoader__.load({
       deleted: '已删除 {count} 条消息。',
       restoreQueued: '已加入恢复队列：{count} 条将在下一回合恢复。',
       busy: '正在处理…',
-      usage: '删除：/msgmgr delete <序号,...>',
+      usage: '删除：/ctxmgr delete <序号,...> · 整轮：/ctxmgr deleteturn <轮号,...>',
       currentSection: '当前消息',
       deletedSection: '已删除',
       selectAll: '全选',
@@ -83,9 +83,9 @@ window.__ModuleLoader__.load({
     }
 
     const en = {
-      open: 'Message manager',
-      title: 'Message manager',
-      subtitle: 'Manage the model context of this session and remove individual messages.',
+      open: 'Context manager',
+      title: 'Context manager',
+      subtitle: 'Manage the model context of this session: delete messages or whole turns, and restore them later.',
       close: 'Close',
       empty: 'There are no manageable messages in the current context.',
       notReady: 'The session is not ready yet.',
@@ -106,7 +106,7 @@ window.__ModuleLoader__.load({
       deleted: 'Deleted {count} messages.',
       restoreQueued: 'Queued {count} message(s) for restore on the next turn.',
       busy: 'Working…',
-      usage: 'Delete: /msgmgr delete <seq,...>',
+      usage: 'Delete: /ctxmgr delete <seq,...> · turns: /ctxmgr deleteturn <turn,...>',
       currentSection: 'Current messages',
       deletedSection: 'Deleted',
       selectAll: 'Select all',
@@ -336,13 +336,20 @@ window.__ModuleLoader__.load({
         && content.some((block) => block?.type === 'tool-addition' || block?.type === 'tool-removal')
     }
 
+    /** Source kinds this plugin writes for tombstones: current, then older releases. */
+    const TOMBSTONE_KINDS = ['context-manager', 'message-manager']
+
+    function isTombstoneKind(kind) {
+      return TOMBSTONE_KINDS.includes(kind)
+    }
+
     function isTombstoneEvent(event) {
       return event !== undefined
         && event !== null
         && event.type === 'developer/message'
         && Array.isArray(event.data?.message?.content)
         && event.data.message.content.length === 0
-        && event.data?.message?.source?.kind === 'message-manager'
+        && isTombstoneKind(event.data?.message?.source?.kind)
         && event.surfaceOp !== null
         && typeof event.surfaceOp === 'object'
         && event.surfaceOp.op === 'replace'
@@ -524,7 +531,7 @@ window.__ModuleLoader__.load({
       return chosen
     }
 
-    function MessageManagerButton({ sessionId, manager, t }) {
+    function ContextManagerButton({ sessionId, manager, t }) {
       const state = useManagerState(manager)
       const translate = typeof t === 'function' ? t : manager.translate
       return h(
@@ -648,7 +655,7 @@ window.__ModuleLoader__.load({
         setStatus(undefined)
         setPending(undefined)
         try {
-          const execution = await manager.executeCommand(sessionId, `/msgmgr ${kind} ${seqs.join(',')}`)
+          const execution = await manager.executeCommand(sessionId, `/ctxmgr ${kind} ${seqs.join(',')}`)
           const result = execution?.result !== undefined ? execution.result : execution
           if (result !== undefined && result !== null && result.kind === 'error') {
             setStatus({ kind: 'error', text: result.text || t('failed') })
@@ -1110,7 +1117,7 @@ window.__ModuleLoader__.load({
     return {
       inject: ['slots', 'sessions', 'locale', 'remote', 'remote.commands'],
       apply(ctx) {
-        ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'message-manager: locale dictionaries')
+        ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'context-manager: locale dictionaries')
         const t = ctx.locale.bind(NS)
         const manager = createManager(ctx.sessions, ctx.remote)
         manager.translate = t
@@ -1119,18 +1126,18 @@ window.__ModuleLoader__.load({
         ctx.slots.inject('conversation.session.header.utilities', () => ctx.slots.register(
           {
             name: 'conversation.session.header.utilities',
-            id: 'message-manager',
+            id: 'context-manager',
             order: 20,
             locale: NS,
             inject: () => ({ manager }),
           },
-          MessageManagerButton,
+          ContextManagerButton,
         ))
 
         ctx.slots.inject('shell.overlay', () => ctx.slots.register(
           {
             name: 'shell.overlay',
-            id: 'message-manager',
+            id: 'context-manager',
             order: 100,
             locale: NS,
             inject: () => ({ manager }),

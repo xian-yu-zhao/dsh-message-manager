@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.6.0
+
+- Renamed the package and bundle from `dsh-message-manager` to `dsh-context-manager` (1.5.0 → 1.6.0): a new npm package plus a renamed GitHub repository. The old package is deprecated on npm in favour of the new one, and the old repository URL redirects to the new one.
+- Renamed the command `/msgmgr` to `/ctxmgr` (same subcommands: `list` / `turns` / `delete` / `deleteturn` / `restore`) and the model tool `message_manager` to `context_manager` (same actions: `list` / `list-turns` / `delete` / `delete-turns` / `restore`). The bundle patch id is now `context-manager`.
+- Renamed the header entry and dialog from 消息管理 to 上下文管理 (Context manager in English); the plugin title in the Plugin Manager follows the same name.
+- README: added a 使用场景 section with concrete workflows — rolling back to the start of a turn and asking again, dropping error logs and trial instructions entry by entry, forgetting superseded conclusions, converging over-long sessions, and the honest limits of removing leaked content — and updated every install source to 1.6.0 with migration steps from the old package.
+- Backward compatible with session logs written by 1.5.0: tombstones whose source kind is `message-manager` and queued records `plugin:message-manager/pending` / `plugin:message-manager/ack` are still recognized, restored and applied, so no manual log cleanup is needed.
+- Plugin market submission moved to `data/plugins/xian-yu-zhao__dsh-context-manager.yml` (category `session`).
+
 ## 1.5.0
 
 - Publishable package: renamed from `@local/dsh-message-manager` to `dsh-message-manager`, dropped `private`, added keywords, `author`, `publishConfig` (public, `registry.npmjs.org`), `homepage`/`bugs`, and a `files` whitelist that covers runtime files, locales, icon and `docs/`.
