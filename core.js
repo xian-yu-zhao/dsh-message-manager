@@ -134,12 +134,63 @@ function visibleSurfaceEvent(event) {
 /** Fixed text-density estimate: 4 characters per token (token-meter heuristic). */
 export const ESTIMATE_CHARS_PER_TOKEN = 4
 
+// CJK / full-width characters price far denser than ASCII: roughly one token
+// per character instead of four. Pricing them separately keeps the ASCII price
+// identical to the token-meter heuristic (so plain English text is unchanged)
+// while making Chinese text, which every 4-chars-per-token rule badly
+// underprices, land close to reality.
+const CJK_TOKEN_RANGES = [
+  [0x1100, 0x11ff], // Hangul Jamo
+  [0x2e80, 0x303e], // CJK radicals and punctuation
+  [0x3041, 0x33ff], // Hiragana, Katakana, CJK compatibility
+  [0x3400, 0x4dbf], // CJK unified ideographs extension A
+  [0x4e00, 0x9fff], // CJK unified ideographs
+  [0xa000, 0xa4cf], // Yi syllables
+  [0xac00, 0xd7a3], // Hangul syllables
+  [0xf900, 0xfaff], // CJK compatibility ideographs
+  [0xfe30, 0xfe4f], // CJK compatibility forms
+  [0xff00, 0xffef], // Full-width / half-width forms
+  [0x20000, 0x3ffff], // CJK unified ideographs extension B and beyond
+]
+
+/** Whether one code point prices at roughly one token per character. */
+export function isCjkCodePoint(codePoint) {
+  if (!Number.isSafeInteger(codePoint)) return false
+  for (const range of CJK_TOKEN_RANGES) {
+    if (codePoint >= range[0] && codePoint <= range[1]) return true
+  }
+  return false
+}
+
+/** Character density in quarter-token units: CJK counts 4, every other char 1. */
+function textUnits(text) {
+  const value = typeof text === 'string' ? text : ''
+  if (value.length === 0) return 0
+  let units = 0
+  for (const character of value) {
+    units += isCjkCodePoint(character.codePointAt(0)) ? ESTIMATE_CHARS_PER_TOKEN : 1
+  }
+  return units
+}
+
 /**
- * Heuristically price one message in tokens, mirroring the dsh-token-meter
- * fixed-density heuristic (4 characters per token, plus per-block and role
- * framing overhead). This is an estimate only: CJK text and dense JSON
- * underprice badly under this rule, so all token figures surfaced by this
- * plugin must be labeled as estimates.
+ * Heuristically price a text fragment: CJK / full-width characters at about one
+ * token each, all other characters at 1/4 token.
+ * @param text - the fragment to price; non-strings price as 0.
+ * @returns heuristic tokens (rounded up).
+ */
+export function estimateTextTokens(text) {
+  return Math.ceil(textUnits(text) / ESTIMATE_CHARS_PER_TOKEN)
+}
+
+/**
+ * Heuristically price one message in tokens. ASCII text keeps the
+ * dsh-token-meter fixed density (4 characters per token); CJK / full-width
+ * characters price at about one token each (see {@link estimateTextTokens}),
+ * because the 4-chars rule underprices them roughly fourfold. Per-block and
+ * role framing overhead are added on top. This is still an estimate only:
+ * dense JSON and mixed scripts stay approximate, so every token figure this
+ * plugin surfaces is labeled as an estimate.
  * @param message - message (event.data for user, event.data.message otherwise).
  * @param isSystem - price as a rendered system prompt (no per-block overhead).
  * @returns heuristic tokens; 0 for empty content (e.g. tombstones).
@@ -149,11 +200,11 @@ export function estimateMessageTokens(message, isSystem = false) {
   const content = Array.isArray(message.content) ? message.content : []
   if (content.length === 0) return 0
   if (isSystem) {
-    let characters = 0
+    let units = 0
     for (const block of content) {
-      characters += block?.type === 'text' ? block.text.length : JSON.stringify(block).length
+      units += textUnits(block?.type === 'text' ? (block.text ?? '') : JSON.stringify(block))
     }
-    return Math.ceil(characters / ESTIMATE_CHARS_PER_TOKEN) + 4
+    return Math.ceil(units / ESTIMATE_CHARS_PER_TOKEN) + 4
   }
   let tokens = 0
   for (const block of content) {
@@ -161,17 +212,17 @@ export function estimateMessageTokens(message, isSystem = false) {
     switch (block.type) {
       case 'text':
       case 'reasoning':
-        tokens += Math.ceil((block.text?.length ?? 0) / ESTIMATE_CHARS_PER_TOKEN) + 4
+        tokens += estimateTextTokens(block.text ?? '') + 4
         break
       case 'tool-call':
-        tokens += Math.ceil((block.name?.length ?? 0) / ESTIMATE_CHARS_PER_TOKEN)
-          + Math.ceil((block.arguments?.length ?? 0) / ESTIMATE_CHARS_PER_TOKEN)
+        tokens += estimateTextTokens(block.name ?? '')
+          + estimateTextTokens(block.arguments ?? '')
           + 4
         break
       default:
         // Merge-extensible/unknown blocks (and image references, whose request
         // price is route-owned) keep a conservative structural JSON price.
-        tokens += 4 + Math.ceil(JSON.stringify(block).length / ESTIMATE_CHARS_PER_TOKEN)
+        tokens += 4 + estimateTextTokens(JSON.stringify(block))
     }
   }
   return tokens + 4
@@ -258,18 +309,65 @@ export function planClean(items, targetTokens, options = {}) {
     // candidates are always chosen deterministically.
     .sort((a, b) => (b.tokens ?? 0) - (a.tokens ?? 0) || a.seq - b.seq)
   const chosen = []
+  const chosenItems = []
   let estimatedFreedTokens = 0
   for (const candidate of candidates) {
     if (estimatedFreedTokens >= targetTokens) break
     chosen.push(candidate.seq)
+    chosenItems.push(candidate)
     estimatedFreedTokens = estimatedFreedTokens + (candidate.tokens ?? 0)
   }
   return {
     chosen,
+    chosenItems,
     candidates: candidates.map((item) => ({ seq: item.seq, role: item.role, tokens: item.tokens ?? 0 })),
     estimatedFreedTokens,
     meetsTarget: estimatedFreedTokens >= targetTokens,
   }
+}
+
+/**
+ * Dry-run preview for {@link planClean}: exactly what a budget clean would
+ * remove, priced the same way, without touching the surface.
+ *
+ * The preview is the plan, not a guess: the same `planClean` result powers the
+ * real clean, so the seqs listed here are the seqs that a confirmed run would
+ * delete (unless the surface changed in between).
+ * @param plan - the result of {@link planClean}.
+ * @param targetTokens - the requested budget, for the header line.
+ * @param previewLimit - how many would-be deletions to list (default 10).
+ */
+export function formatCleanPlan(plan, targetTokens, previewLimit = 10) {
+  const target = Number.isSafeInteger(targetTokens)
+    ? targetTokens.toLocaleString('en-US')
+    : String(targetTokens ?? 0)
+  const chosenItems = Array.isArray(plan?.chosenItems) ? plan.chosenItems : []
+  const candidateCount = Array.isArray(plan?.candidates) ? plan.candidates.length : 0
+  const freed = Number.isSafeInteger(plan?.estimatedFreedTokens) ? plan.estimatedFreedTokens : 0
+  const limit = Math.max(1, Number.isSafeInteger(previewLimit) ? previewLimit : 10)
+  const lines = [`按预算清理预览（目标 ≈${target} tokens，未删除任何消息）：`]
+  if (chosenItems.length === 0) {
+    lines.push(`候选池 ${candidateCount} 条里没有可清理的消息——只有用户/上下文消息，或剩下的都太小、太新被保护。`)
+    lines.push('想放宽：/ctxmgr clean <目标tokens> --min 50 --protect 1（候选阈值与保护条数）。')
+    return lines.join('\n')
+  }
+  lines.push(`将从 ${candidateCount} 条候选里清理 ${chosenItems.length} 条，预计释放 ≈${freed.toLocaleString('en-US')} tokens（启发式估算）。`)
+  const shown = chosenItems.slice(0, limit)
+  for (const item of shown) {
+    const role = item.role === 'tool' ? '工具' : item.role === 'assistant' ? '助手' : String(item.role ?? '?')
+    const preview = typeof item.preview === 'string' && item.preview.length > 0
+      ? item.preview.length > 60 ? `${item.preview.slice(0, 60)}…` : item.preview
+      : '（无预览）'
+    lines.push(`  #${item.seq} ${role} ≈${(item.tokens ?? 0).toLocaleString('en-US')} tok · ${preview}`)
+  }
+  if (chosenItems.length > shown.length) lines.push(`  …另 ${chosenItems.length - shown.length} 条未展开`)
+  if (!plan?.meetsTarget && Number.isSafeInteger(targetTokens)) {
+    const gap = Math.max(0, targetTokens - freed)
+    lines.push('', `候选池不够：最多只能释放 ≈${freed.toLocaleString('en-US')} tokens，离目标还差 ≈${gap.toLocaleString('en-US')}。`)
+  }
+  lines.push('', `确认执行：/ctxmgr clean ${Number.isSafeInteger(targetTokens) ? targetTokens : target}`)
+  lines.push('删除复用按条删除的墓碑与持久队列，之后仍可 /ctxmgr undo-batch 撤销。')
+  return lines.join('\n')
 }
 
 /** Boundary turn/step for a tombstone: prefer the deleted nodes, then neighbors. */
@@ -574,7 +672,7 @@ export function formatList(items, deleted = [], pending = [], limit = 30) {
   lines.push('整轮：/ctxmgr deleteturn <轮号,...>（list-turns 查看轮号）')
   lines.push('清理：/ctxmgr clean <目标tokens>（自动挑选大体积工具/助手消息，保护用户消息与最近消息）')
   lines.push('恢复：/ctxmgr restore <删除记录序号,...>（也可在标题栏的上下文管理弹窗中操作）')
-  lines.push('删除只会从后续模型请求的上下文中移除该消息，原始会话日志与聊天记录仍会保留。token 数为启发式估算（4 字符/token），中文与 JSON 内容会明显低估。')
+  lines.push('删除只会从后续模型请求的上下文中移除该消息，原始会话日志与聊天记录仍会保留。token 数为启发式估算：ASCII 按 4 字符/token、中日韩与全角字符约 1 字符/token，密集 JSON 仍是近似值。')
   return lines.join('\n')
 }
 
@@ -678,6 +776,15 @@ export function pickUndoBatch(batches, batchId = undefined) {
   return matches[matches.length - 1]
 }
 
+/** Human-readable label for a ledger result. */
+function batchResultLabel(result) {
+  return result === 'applied'
+    ? '成功'
+    : result === 'queued'
+      ? '排队中'
+      : result === 'failed' ? '失败' : '跳过'
+}
+
 /** Human-readable audit trail for the batch ledger. */
 export function formatBatches(batches, limit = 20) {
   if (!Array.isArray(batches) || batches.length === 0) {
@@ -687,30 +794,77 @@ export function formatBatches(batches, limit = 20) {
       '撤销最近一次：/ctxmgr undo-batch（有台账后可用）',
     ].join('\n')
   }
+  // One operation can append several records — queued when it was written,
+  // then applied (or kept queued) at replay — so the ledger must read as one
+  // row per batch, not as N operations. Grouping by batchId keeps the audit
+  // trail truthful without the append-only log having to be rewritten.
+  const groups = new Map()
+  const order = []
+  for (const entry of batches) {
+    if (entry === null || typeof entry !== 'object') continue
+    const key = typeof entry.batchId === 'string' && entry.batchId.length > 0
+      ? entry.batchId
+      : `record:${entry.recordSeq}`
+    if (!groups.has(key)) {
+      groups.set(key, [])
+      order.push(key)
+    }
+    groups.get(key).push(entry)
+  }
+  const collapsed = order.map((key) => {
+    const entries = groups.get(key)
+    const results = []
+    for (const entry of entries) {
+      if (!results.includes(entry.result)) results.push(entry.result)
+    }
+    return { entries, results, final: entries[entries.length - 1] }
+  })
   // Clamp so limit=0 cannot accidentally mean "show everything".
   const safeLimit = Math.max(1, Number.isSafeInteger(limit) ? limit : 20)
-  const shown = batches.length > safeLimit ? batches.slice(-safeLimit) : batches
-  const lines = [`操作台账（共 ${batches.length} 条，显示最近 ${shown.length} 条）：`]
-  for (const entry of shown) {
+  const shown = collapsed.length > safeLimit ? collapsed.slice(-safeLimit) : collapsed
+  const lines = collapsed.length === batches.length
+    ? [`操作台账（共 ${collapsed.length} 个批次，显示最近 ${shown.length} 个）：`]
+    : [`操作台账（共 ${collapsed.length} 个批次 / ${batches.length} 条记录，显示最近 ${shown.length} 个）：`]
+  for (const group of shown) {
+    const entry = group.final
     const short = typeof entry.batchId === 'string' ? entry.batchId.slice(0, 8) : '未知'
-    const tokens = (Number.isSafeInteger(entry.estimatedFreedTokens) ? entry.estimatedFreedTokens : 0)
-      .toLocaleString('en-US')
-    const result = entry.result === 'applied'
-      ? '成功'
-      : entry.result === 'queued'
-        ? '排队中'
-        : entry.result === 'failed' ? '失败' : '跳过'
-    // Prefer the message count when the Host recorded it: one batch can remove
-    // more messages than it names as targets (a tool group travels together).
-    const count = Number.isSafeInteger(entry.count) && entry.count > 0
-      ? entry.count
-      : Array.isArray(entry.seqs) ? entry.seqs.length : 0
-    const reason = typeof entry.reason === 'string' && entry.reason.length > 0 ? `（${entry.reason}）` : ''
-    lines.push(`#${entry.recordSeq} ${short} · ${entry.op} · ${count} 条消息 · ≈${tokens} tok · ${result}${reason}`)
+    // One batch can span several records: a queued operation is applied one
+    // target at a time at replay, so each target gets its own applied/skipped
+    // record. Total the rows that actually landed (falling back to the queued
+    // estimate when nothing has landed yet) so the row reports the batch, not
+    // just its last record.
+    const landed = group.entries.filter((candidate) => candidate.result === 'applied'
+      || candidate.result === 'skipped' || candidate.result === 'failed')
+    const basis = landed.length > 0
+      ? landed
+      : group.entries.filter((candidate) => candidate.result === 'queued')
+    const pricedRows = basis.length > 0 ? basis : group.entries
+    let tokens = 0
+    let count = 0
+    for (const row of pricedRows) {
+      // Only applied/queued rows say how many messages the batch moved and how
+      // much it relieved; a skipped or failed target removed nothing, so it must
+      // not inflate either figure.
+      if (row.result !== 'applied' && row.result !== 'queued') continue
+      tokens += Number.isSafeInteger(row.estimatedFreedTokens) ? row.estimatedFreedTokens : 0
+      if (Number.isSafeInteger(row.count) && row.count > 0) count += row.count
+      else if (Array.isArray(row.seqs)) count += row.seqs.length
+    }
+    const result = group.results.map(batchResultLabel).join(' → ')
+    const withReason = [...group.entries].reverse()
+      .find((candidate) => typeof candidate.reason === 'string' && candidate.reason.length > 0)
+    const reason = withReason !== undefined ? `（${withReason.reason}）` : ''
+    // Undo rows count deletion records (tombstones), not messages, and a restore
+    // frees no tokens — label them so the two units are never read as one.
+    const undoRow = entry.op === 'undo'
+    const unit = undoRow ? '条删除记录' : '条消息'
+    const tokenText = undoRow ? '—' : `≈${tokens.toLocaleString('en-US')} tok`
+    lines.push(`#${entry.recordSeq} ${short} · ${entry.op} · ${count} ${unit} · ${tokenText} · ${result}${reason}`)
   }
+  if (collapsed.length > shown.length) lines.push(`…另 ${collapsed.length - shown.length} 个更早的批次未展开`)
   lines.push('', '撤销最近一次：/ctxmgr undo-batch',
     '撤销指定批次：/ctxmgr undo-batch <batchId 前几位>（台账里 “·” 前的 8 位）')
-  lines.push('台账与墓碑都写在会话日志里，只增不改，重启后仍可查。')
+  lines.push('台账与墓碑都写在会话日志里，只增不改，重启后仍可查；同一批次的「排队中 → 成功」是同一操作的两条记录，不是两次操作。')
   return lines.join('\n')
 }
 /** Human-readable turn listing for a command or tool result. */

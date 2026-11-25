@@ -2,10 +2,16 @@
 
 ## 1.7.3
 
+- 新增：`clean` 支持**试运行预览**——`/ctxmgr clean <目标tokens> --dry-run`（别名 `-d` / `dryrun` / `预览`）列出确认执行时会被移除的序号与估算 tokens，不删除任何消息、不写台账。预览给出候选池大小、将清理条数、预计释放 tokens，每条 `#序号 角色 ≈N tok · 预览`，并带 `确认执行：/ctxmgr clean <目标>` 与候选池不够时的差额提示。预览与真实清理共用同一个 `planClean`，所以列出的序号就是确认清理会删掉的序号（表面未变的前提下）。工具等价：`context_manager` + `action: 'clean'` + `dryRun: true`（`minCandidateTokens` / `protectRecent` 照旧）。
+- 改进：操作台账改为**按批次一行**——`/ctxmgr batches` 把只增不改的 `plugin:context-manager/batch` 记录按 `batchId` 归组，「先排队、后应用」的批次显示为 `排队中 → 成功` 一行，不再像两条记录那样被误读成两次操作；批次与记录数不一致时表头显示 `共 N 个批次 / M 条记录`，更早批次被折叠时提示 `…另 N 个更早的批次未展开`。日志本身仍是只增不改，只有显示层分组。
+- 改进：token 估算支持中日韩字符——ASCII 文本仍按 4 字符 ≈ 1 token（与 DSH 的 `dsh-token-meter` 一致），CJK / 全角字符改为约 1 字符 1 token（旧的 4 字符规则把中文低估约四倍）；每块 `+4`、每角色 `+4` 开销不变，空内容（墓碑）仍为 0。仍是启发式估算；注入 token-meter 时 Host 仍优先 `ctx.tokenMeter.measure()` 节点定价，本地估算作为兜底，并用于 `clean` 排序、弹窗 `≈N tok` 标签与总计。
 - 文档：README 按 `dsh-plugin-readme` 规范重写为**英文主文 + 中文说明**，结构改为 Why / Install / Requirements / Advantages / Use cases / Tools & Commands / Boundaries & limitations / Deep mechanics / Changelog；旧的整篇中文长文不再保留。
 - 文档：文件结构、开发与测试、发布流程、插件市场收录移到新的 `CONTRIBUTING.md`（维护者向）。
-- 文档：`docs/DETAIL.md` / `docs/DETAIL.zh.md` 补齐五节——表面替换与生效时机、幂等与旧数据兼容、审计台账字段、恢复的能力边界、行为与限制。
-- 无代码变更，功能与 1.7.2 完全一致。
+- 文档：`docs/DETAIL.md` / `docs/DETAIL.zh.md` 补齐五节——表面替换与生效时机、幂等与旧数据兼容、审计台账字段、恢复的能力边界、行为与限制；并补充 dry-run 预览、台账按批次显示与 CJK token 估算。
+- 修复：排队执行的 `clean` 在台账里被记成 `delete`——pending 记录只写 `delete`、重放时也写死 `delete`。现在 pending 记录保留 `clean`，重放按用户实际执行的操作入账。
+- 修复：`/ctxmgr batches` 在同一进程内偶发读成空台账（记录明明仍在日志里）。现在按会话缓存已读台账记录且只增不减，扫描抖动不会再让历史记录消失。
+- 改进：台账行按批次汇总**实际落地**的条数与释放 tokens——跳过/失败的记录不再虚增；一个排队批次按目标逐条重放产生的多条记录会合成一行正确合计。
+- 文案：`list` 页脚改为新的 token 估算规则（ASCII 4 字符/token、CJK ≈1 字符/token）；排队删除的提示补充「已被更早操作移除的序号重放时记为跳过」。台账里 `undo` 行改用「条删除记录」并以 `—` 代替 tokens 列（撤销不释放 tokens），避免把「1 条删除记录」误读成「只恢复 1 条消息」。
 
 ## 1.7.2
 

@@ -51,7 +51,7 @@ The new version still recognizes old tombstones (`kind: message-manager`) and qu
 | **Reversible（可逆）** | Every delete / turn-delete / clean / undo is a tombstone in the append-only log; `restore` / `undo-batch` brings it back. |
 | **Surgical（就地裁剪）** | Remove exact messages or whole turns (prompt + work + reply + injected context together). |
 | **Budget clean（按预算清理）** | `/ctxmgr clean 60000` drops the largest tool/assistant messages until the target is met; user messages are never eligible. |
-| **Audit ledger（审计台账）** | Each operation appends one `plugin:context-manager/batch` record; restart-safe, no external files. |
+| **Audit ledger（审计台账）** | Each operation appends one `plugin:context-manager/batch` record; the ledger view groups records by batch id (one row per batch), restart-safe, no external files. |
 | **Recall by seq（按 seq 召回）** | Tombstones carry a short `{ seq, role, preview }` pointer; raw events stay in the log, readable via session-query tools. |
 | **Local compaction（局部压缩）** | `/ctxmgr compact <start> <end>` sends only the user selection to the official engine. |
 | **No-message-rewrite（不改原文）** | Only empty developer messages are appended as surface replacements; the original log is never rewritten. |
@@ -65,6 +65,7 @@ The new version still recognizes old tombstones (`kind: message-manager`) and qu
 - **Forget superseded conclusions** — delete the turns holding overturned plans: `/ctxmgr turns` → `/ctxmgr deleteturn 3,4`.
 - **Converge a long session** — remove early exploration turns, keep decision turns: `/ctxmgr deleteturn 2,3,4`.
 - **Trim by budget** — `/ctxmgr clean 60000` (largest tool/assistant first; protects user messages + recent 3).
+- **Preview before trimming** — `/ctxmgr clean 60000 --dry-run` lists exactly the seqs and estimated tokens a confirmed clean would remove, deleting nothing and writing no ledger entry; drop the flag to apply.
 - **Leak stop, with honest limits** — `/ctxmgr delete 9` removes it from the **model context**; the raw session log and chat transcript still contain it. **Not an erasure tool.**
 
 Tool equivalents: `context_manager` with `action` = `delete-turns` / `delete` / `clean` etc.
@@ -80,14 +81,14 @@ The model may call `context_manager`; `action` ∈ `list` / `list-turns` / `dele
 | `/ctxmgr delete <seq,...>` | Delete messages by seq |
 | `/ctxmgr deleteturn <turn,...>` | Delete whole turns |
 | `/ctxmgr restore <record-seq,...>` | Restore deletion records |
-| `/ctxmgr clean <target-tokens>` | Budget clean (tool / assistant only; user messages protected) |
+| `/ctxmgr clean <target-tokens> [--dry-run] [--min <n>] [--protect <n>]` | Budget clean (tool / assistant only; user messages protected); `--dry-run` previews the exact seqs + estimated tokens without deleting |
 | `/ctxmgr compact <start> <end>` | Local compaction via official `ctx.compaction.compactRegion` |
-| `/ctxmgr batches` | Audit ledger (aliases `ledger` / `audit`) |
+| `/ctxmgr batches` | Audit ledger, one row per batch (aliases `ledger` / `audit`) |
 | `/ctxmgr undo-batch [batchId]` | Undo latest / a specific batch (alias `undo-last`) |
 
-Tool parameters: `seqs` (message / turn / record seq per action), `start` / `end` (`compact`, surface positions), `targetTokens`, `minCandidateTokens` (default `100`), `protectRecent` (default `3`), `batchId` (prefix match for `undo-batch`).
+Tool parameters: `seqs` (message / turn / record seq per action), `start` / `end` (`compact`, surface positions), `targetTokens`, `minCandidateTokens` (default `100`), `protectRecent` (default `3`), `dryRun` (`clean`: preview only — deletes nothing and writes no ledger entry), `batchId` (prefix match for `undo-batch`). The `clean` flags `--dry-run` (aliases `-d` / `dryrun` / `预览`), `--min <n>` and `--protect <n>` map to `dryRun`, `minCandidateTokens` and `protectRecent`.
 
-**Dialog**: title-bar list icon → **Context manager**. Sections: budget + token clean (top), turns (per-turn delete), current messages (collapsed by default; filter by role affects display only, user rows are **protected**), deleted (restore per record, batch id shown, falls back to recall pointer). The confirm bar reports total messages removed and estimated tokens freed. Deletion affects **later model requests** only.
+**Dialog**: title-bar list icon → **Context manager**. Sections: budget + token clean (top, with a **预览 / Preview** button that runs the same dry run and keeps your selection), turns (per-turn delete), current messages (collapsed by default; filter by role affects display only, user rows are **protected**), deleted (restore per record, batch id shown, falls back to recall pointer). The confirm bar reports total messages removed and estimated tokens freed. Deletion affects **later model requests** only.
 
 ## Boundaries & limitations
 
@@ -104,13 +105,17 @@ Two limits worth knowing up front: deleted messages **still appear in chat histo
 
 ## Deep mechanics
 
-Deletion is an append-only surface replacement; targets in earlier steps apply immediately, others queue to the next `agent/request`. All operations are idempotent (ack, never replayed twice) and survive restarts. Recall pointers, audit-ledger fields, the local-compaction contract, token-estimate heuristics, the restore capability boundary, and behavior limits are documented in [docs/DETAIL.md](docs/DETAIL.md) / [中文版](docs/DETAIL.zh.md).
+Deletion is an append-only surface replacement; targets in earlier steps apply immediately, others queue to the next `agent/request`. All operations are idempotent (ack, never replayed twice) and survive restarts.
 
-**中文说明：** 删除是只追加的表面替换；更早步骤立即生效，其余排队到下一个 `agent/request`，ack 保证不重放。召回指针、台账字段、压缩契约、token 估算、恢复能力边界与行为限制详见 DETAIL 文档。
+Token figures — the `≈N tok` labels, the total, and the `clean` ranking — price ASCII text at 4 characters per token (the same density as DSH's `dsh-token-meter`) and CJK / full-width characters at about one token per character. Per-block `+4` and per-role `+4` overhead are unchanged, and empty content (a tombstone) prices at 0. When a token meter is injected the Host prefers `ctx.tokenMeter.measure()` node pricing, with the local estimate as the fallback; all figures remain heuristic estimates.
+
+Recall pointers, audit-ledger fields, the local-compaction contract, token-estimate details, the restore capability boundary, and behavior limits are documented in [docs/DETAIL.md](docs/DETAIL.md) / [中文版](docs/DETAIL.zh.md).
+
+**中文说明：** 删除是只追加的表面替换；更早步骤立即生效，其余排队到下一个 `agent/request`，ack 保证不重放。token 估算：ASCII 按 4 字符 ≈ 1 token（与 `dsh-token-meter` 一致），中日韩/全角字符约 1 字符 1 token，有 token-meter 时优先其节点定价；台账按批次号聚合成一行。召回指针、台账字段、压缩契约、token 估算、恢复能力边界与行为限制详见 DETAIL 文档。
 
 ## Changelog
 
-- `1.7.3` — Docs only: README rewritten in the English-led house style (Why / Advantages / Use cases / Boundaries / Deep mechanics), maintainer notes moved to `CONTRIBUTING.md`, DETAIL docs expanded. No code changes.
+- `1.7.3` — `clean --dry-run` preview (lists the seqs + estimated tokens a confirmed clean would remove; nothing deleted, no ledger entry); `/ctxmgr batches` now reads one row per batch (`排队中 → 成功`) and totals the batch's landed records while the log stays append-only; a queued `clean` is recorded as `clean` (not `delete`); CJK-aware token estimate (ASCII 4 chars/token, CJK / full-width ≈1 token per char). Docs: README rewritten in the English-led house style, `CONTRIBUTING.md` added, DETAIL docs expanded.
 - `1.7.2` — `compact` unbalanced errors translated into Chinese with actionable hints; ledger full-scans the session log.
 - `1.7.1` — Fixed empty `/ctxmgr batches` and queue cursor bugs; `undo-batch` no longer reselects undone batches.
 - `1.7.0` — Token metering, budget `clean`, batch ids, ledger, recall pointers, local `compact`, filter dropdown, 49 tests.

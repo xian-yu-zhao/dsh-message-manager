@@ -102,6 +102,8 @@ window.__ModuleLoader__.load({
       batchLabel: '批次 {id}',
       cleanBudget: '预算',
       cleanInvalid: '请输入正整数 token 预算。',
+      cleanPreview: '预览',
+      cleanPreviewDone: '按预算清理预览完成，未删除任何消息（目标 ≈{tokens} tokens）。',
     }
 
     const en = {
@@ -178,6 +180,8 @@ window.__ModuleLoader__.load({
       batchLabel: 'batch {id}',
       cleanBudget: 'Budget',
       cleanInvalid: 'Enter a positive integer token budget.',
+      cleanPreview: 'Preview',
+      cleanPreviewDone: 'Budget clean preview finished; nothing was deleted (target ≈{tokens} tokens).',
     }
 
     const CSS = `
@@ -391,22 +395,73 @@ window.__ModuleLoader__.load({
         && content.some((block) => block?.type === 'tool-addition' || block?.type === 'tool-removal')
     }
 
-    /** Heuristic token estimate (4 chars ≈ 1 token), mirrors the Host estimate; CJK/JSON underpriced. */
+    /** Fixed text-density estimate: 4 characters per token (token-meter heuristic). */
+    const ESTIMATE_CHARS_PER_TOKEN = 4
+
+    // CJK / full-width characters price far denser than ASCII: roughly one token
+    // per character instead of four. Pricing them separately keeps the ASCII price
+    // identical to the token-meter heuristic (so plain English text is unchanged)
+    // while making Chinese text, which every 4-chars-per-token rule badly
+    // underprices, land close to reality.
+    const CJK_TOKEN_RANGES = [
+      [0x1100, 0x11ff], // Hangul Jamo
+      [0x2e80, 0x303e], // CJK radicals and punctuation
+      [0x3041, 0x33ff], // Hiragana, Katakana, CJK compatibility
+      [0x3400, 0x4dbf], // CJK unified ideographs extension A
+      [0x4e00, 0x9fff], // CJK unified ideographs
+      [0xa000, 0xa4cf], // Yi syllables
+      [0xac00, 0xd7a3], // Hangul syllables
+      [0xf900, 0xfaff], // CJK compatibility ideographs
+      [0xfe30, 0xfe4f], // CJK compatibility forms
+      [0xff00, 0xffef], // Full-width / half-width forms
+      [0x20000, 0x3ffff], // CJK unified ideographs extension B and beyond
+    ]
+
+    /** Whether one code point prices at roughly one token per character. */
+    function isCjkCodePoint(codePoint) {
+      if (!Number.isSafeInteger(codePoint)) return false
+      for (const range of CJK_TOKEN_RANGES) {
+        if (codePoint >= range[0] && codePoint <= range[1]) return true
+      }
+      return false
+    }
+
+    /** Character density in quarter-token units: CJK counts 4, every other char 1. */
+    function textUnits(text) {
+      const value = typeof text === 'string' ? text : ''
+      if (value.length === 0) return 0
+      let units = 0
+      for (const character of value) {
+        units += isCjkCodePoint(character.codePointAt(0)) ? ESTIMATE_CHARS_PER_TOKEN : 1
+      }
+      return units
+    }
+
+    /** Heuristic price for one text fragment: CJK ≈ 1 token/char, all other chars 1/4 token. */
+    function estimateTextTokens(text) {
+      return Math.ceil(textUnits(text) / ESTIMATE_CHARS_PER_TOKEN)
+    }
+
+    /**
+     * Heuristic token estimate, mirrors the Host estimate: ASCII text prices at
+     * 4 characters per token, CJK / full-width characters at about one token each,
+     * plus per-block and role framing overhead. Still an estimate only.
+     */
     function estimateTokens(message, isSystem) {
       if (message === undefined || message === null) return 0
       const content = Array.isArray(message.content) ? message.content : []
       if (content.length === 0) return 0
       if (isSystem) {
-        let chars = 0
-        for (const block of content) chars += block?.type === 'text' ? (block.text?.length ?? 0) : JSON.stringify(block).length
-        return Math.ceil(chars / 4) + 4
+        let units = 0
+        for (const block of content) units += textUnits(block?.type === 'text' ? (block.text ?? '') : JSON.stringify(block))
+        return Math.ceil(units / ESTIMATE_CHARS_PER_TOKEN) + 4
       }
       let tokens = 0
       for (const block of content) {
         if (block === null || typeof block !== 'object') continue
-        if (block.type === 'text' || block.type === 'reasoning') tokens += Math.ceil((block.text?.length ?? 0) / 4) + 4
-        else if (block.type === 'tool-call') tokens += Math.ceil((block.name?.length ?? 0) / 4) + Math.ceil((block.arguments?.length ?? 0) / 4) + 4
-        else tokens += 4 + Math.ceil(JSON.stringify(block).length / 4)
+        if (block.type === 'text' || block.type === 'reasoning') tokens += estimateTextTokens(block.text ?? '') + 4
+        else if (block.type === 'tool-call') tokens += estimateTextTokens(block.name ?? '') + estimateTextTokens(block.arguments ?? '') + 4
+        else tokens += 4 + estimateTextTokens(JSON.stringify(block))
       }
       return tokens + 4
     }
@@ -772,19 +827,28 @@ window.__ModuleLoader__.load({
         }
       }
 
-      const runClean = async (targetTokens) => {
+      const runClean = async (targetTokens, options) => {
         if (busy || !Number.isSafeInteger(targetTokens) || targetTokens <= 0) return
+        const dryRun = options?.dryRun === true
         setBusy(true)
         setStatus(undefined)
         setPending(undefined)
         try {
-          const execution = await manager.executeCommand(sessionId, `/ctxmgr clean ${targetTokens}`)
+          const execution = await manager.executeCommand(
+            sessionId,
+            `/ctxmgr clean ${targetTokens}${dryRun ? ' --dry-run' : ''}`,
+          )
           const result = execution?.result !== undefined ? execution.result : execution
           if (result !== undefined && result !== null && result.kind === 'error') {
             setStatus({ kind: 'error', text: result.text || t('failed') })
             return
           }
           const text = result !== undefined && result !== null && result.kind === 'success' ? result.text : undefined
+          if (dryRun) {
+            // Preview deletes nothing, so the selection must survive.
+            setStatus({ kind: 'success', text: text || t('cleanPreviewDone', { tokens: targetTokens.toLocaleString('en-US') }) })
+            return
+          }
           setStatus({ kind: 'success', text: text || t('cleaned', { tokens: targetTokens.toLocaleString('en-US') }) })
           setSelectedItems(new Set())
         } catch (error) {
@@ -1139,6 +1203,23 @@ window.__ModuleLoader__.load({
                   },
                 },
                 t('cleanSelected', { count: cleanBudget }),
+              ),
+              h(
+                'button',
+                {
+                  type: 'button',
+                  className: 'dshmm-small',
+                  disabled: busy,
+                  onClick: () => {
+                    const budget = Number.parseInt(cleanBudget, 10)
+                    if (!Number.isSafeInteger(budget) || budget <= 0) {
+                      setStatus({ kind: 'error', text: t('cleanInvalid') })
+                      return
+                    }
+                    runClean(budget, { dryRun: true })
+                  },
+                },
+                t('cleanPreview'),
               ),
             ),
           ),

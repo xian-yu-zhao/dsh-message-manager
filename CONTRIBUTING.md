@@ -12,7 +12,7 @@ Maintainer-facing notes. Users only need the [README](README.md); deep mechanics
 | `cordis.patch.yml` | Inserts one plugin row into the profile patch |
 | `locale/*.json` | Plugin-manager / detail-page titles, descriptions, doc paths |
 | `docs/DETAIL*.md`, `docs/preview.svg` | Detail-page docs (single text-free preview) |
-| `test/*.test.mjs` | 49 zero-dependency `node:test` cases |
+| `test/*.test.mjs` | 69 zero-dependency `node:test` cases |
 
 **About `@deepseek-ai/*` imports:** the Host needs internal helpers of `@deepseek-ai/dsh-session`. With `link:` installs the real path is outside the profile, so a bare import fails with `ERR_MODULE_NOT_FOUND`; the plugin first tries a bare import, then builds an absolute asar URL from `process.argv[2]` (Host cwd) — the same URL resolves to the same module instance, which the Session private brand check requires.
 
@@ -24,17 +24,17 @@ node --check index.js
 node --check client.js
 node --check core.js
 
-# Tests: 49 zero-dependency cases, built-in modules only
+# Tests: 69 zero-dependency cases, built-in modules only
 node --test "test/*.test.mjs"
 ```
 
 | Test file | Cases |
 |-----------|-------|
-| `test/core.test.mjs` | 9 |
-| `test/batch.test.mjs` | 14 |
+| `test/core.test.mjs` | 24 |
+| `test/batch.test.mjs` | 19 |
 | `test/surface.test.mjs` | 26 |
 
-Coverage: `planDeletion` tool-group linkage, `deletedFromSurface`, `foldSurface` (including malformed surfaces missing `seq`), `turnsFromSurface`, `planClean` protection/ordering, `undo-batch` selection (including ambiguous-prefix rejection), recall pointers and tombstone projection.
+Coverage: `planDeletion` tool-group linkage, `deletedFromSurface`, `foldSurface` (including malformed surfaces missing `seq`), `turnsFromSurface`, `planClean` protection/ordering, `formatCleanPlan` dry-run preview (gap and preview limits), CJK-aware token pricing (`isCjkCodePoint` / `estimateTextTokens`), `formatBatches` one-row-per-batch grouping, `undo-batch` selection (including ambiguous-prefix rejection), recall pointers and tombstone projection.
 
 Client edits need a page refresh (F5) or app restart; Host edits need a bundle reinstall:
 

@@ -34,6 +34,7 @@ import {
   buildRecall,
   deletedFromSurface,
   formatBatches,
+  formatCleanPlan,
   matchUndoBatches,
   foldSurface,
   formatList,
@@ -262,7 +263,7 @@ function durableQueue(ctx, session) {
       const op = record.data?.op
       const targetSeq = record.data?.targetSeq
       const batchId = record.data?.batchId
-      if ((op === 'delete' || op === 'restore' || op === 'delete-turn') && Number.isSafeInteger(targetSeq)) {
+      if ((op === 'delete' || op === 'clean' || op === 'restore' || op === 'delete-turn') && Number.isSafeInteger(targetSeq)) {
         state.pending.set(record.seq, {
           recordSeq: record.seq,
           op,
@@ -323,6 +324,9 @@ function appendBatchLedger(session, entry) {
  * is only read by a user-invoked command, and one pass over the in-memory log
  * is cheap, so correctness wins over a cursor here.
  */
+/** Per-plugin-instance, per-session ledger cache: a record, once seen, never disappears. */
+const ledgerCaches = new WeakMap()
+
 function batchesFromLog(ctx, session) {
   const entries = []
   const events = session.snapshotEvents()
@@ -344,7 +348,19 @@ function batchesFromLog(ctx, session) {
       reason: typeof data.reason === 'string' ? data.reason : undefined,
     })
   }
-  return entries
+  // The log is append-only, so a scan that suddenly yields fewer records than an
+  // earlier scan in the same process is a read hiccup, not a deletion. Merge into
+  // a per-session cache and only ever grow: `/ctxmgr batches` must not flip to
+  // "empty ledger" while the records are demonstrably still in the log.
+  let cache = ledgerCaches.get(ctx)
+  if (cache === undefined) {
+    cache = new Map()
+    ledgerCaches.set(ctx, cache)
+  }
+  const known = cache.get(session.id) ?? new Map()
+  for (const entry of entries) known.set(entry.recordSeq, entry)
+  cache.set(session.id, known)
+  return [...known.values()].sort((a, b) => a.recordSeq - b.recordSeq)
 }
 
 /** List the audit ledger for one live session. */
@@ -739,12 +755,14 @@ async function deleteMessages(ctx, agent, seqs, options = {}) {
   }
 
   const queuedTargets = new Set(durableQueue(ctx, session)
-    .filter((entry) => entry.op === 'delete')
+    .filter((entry) => entry.op === 'delete' || entry.op === 'clean')
     .map((entry) => entry.targetSeq))
   let added = 0
   for (const target of targets) {
     if (queuedTargets.has(target.seq)) continue
-    appendPending(session, 'delete', target.seq, batchId)
+    // Keep "clean" in the pending record so replay can record the batch with the
+    // operation the user actually ran, not a generic delete.
+    appendPending(session, opName === 'clean' ? 'clean' : 'delete', target.seq, batchId)
     queuedTargets.add(target.seq)
     added += 1
   }
@@ -754,7 +772,7 @@ async function deleteMessages(ctx, agent, seqs, options = {}) {
   return {
     text: added === 0
       ? '选中的消息已在删除队列中，将在下一次请求开始时生效。'
-      : `已加入删除队列：${added} 条消息将在下一次请求开始时从模型上下文移除，估算释放约 ${estimatedFreedTokens.toLocaleString('en-US')} tokens（会话日志与聊天记录仍保留）。批次 ${batchId.slice(0, 8)}，下一次请求生效后可用 /ctxmgr undo-batch 撤销。`,
+      : `已加入删除队列：${added} 条消息将在下一次请求开始时从模型上下文移除，估算释放约 ${estimatedFreedTokens.toLocaleString('en-US')} tokens（会话日志与聊天记录仍保留）。批次 ${batchId.slice(0, 8)}，下一次请求生效后可用 /ctxmgr undo-batch 撤销。${added < targets.length ? `另有 ${targets.length - added} 条已在队列中，不重复入队。` : ''}重放时若某个序号已被更早的操作移除，会记为「跳过」而不是报错。`,
     count: added,
     estimatedFreedTokens,
     batchId,
@@ -762,13 +780,24 @@ async function deleteMessages(ctx, agent, seqs, options = {}) {
   }
 }
 
-/** Token-budget cleanup: plan candidates then delete them via the normal pipeline. */
+/** Token-budget cleanup: plan candidates, then preview or delete them via the normal pipeline. */
 async function cleanMessages(ctx, agent, targetTokens, options) {
   const session = liveSession(ctx, agent)
   const events = await readSurfaceEvents(ctx, session)
   const tokensBySeq = buildTokensBySeq(ctx, session)
   const items = itemsFromSurface(events, tokensBySeq)
   const cleanPlan = planClean(items, targetTokens, options)
+  if (options?.dryRun === true) {
+    // Preview only: nothing is deleted and no ledger entry is written, so a
+    // dry run never pollutes the audit trail.
+    return {
+      text: formatCleanPlan(cleanPlan, targetTokens),
+      count: 0,
+      estimatedFreedTokens: cleanPlan.estimatedFreedTokens,
+      queued: false,
+      dryRun: true,
+    }
+  }
   if (cleanPlan.chosen.length === 0) {
     return {
       text: '没有可清理的消息（只有用户/上下文消息，或剩余消息都太小、太新被保护）。token 数为启发式估算，实际可能略少。',
@@ -1009,13 +1038,16 @@ function applyQueuedOperations(ctx, agent, turn, step) {
     + run.seqs.reduce((inner, seq) => inner + (tokensOfSeq.get(seq) ?? 0), 0), 0)
   for (const entry of queue) {
     try {
-      if (entry.op === 'delete') {
+      if (entry.op === 'delete' || entry.op === 'clean') {
+        // Replay records the batch under the operation the user actually ran;
+        // a queued budget clean must not read as a plain delete afterwards.
+        const ledgerOp = entry.op === 'clean' ? 'clean' : 'delete'
         const plan = planDeletion(surfaceEventsSync(session), entry.targetSeq)
         if (!plan.ok) {
           appendAck(session, entry.recordSeq, 'skipped', `target #${entry.targetSeq} ${plan.reason}`)
           appendBatchLedger(session, {
             batchId: entry.batchId ?? `pending-${entry.recordSeq}`,
-            op: 'delete',
+            op: ledgerOp,
             seqs: [entry.targetSeq],
             tombstoneSeqs: [],
             estimatedFreedTokens: 0,
@@ -1028,7 +1060,7 @@ function applyQueuedOperations(ctx, agent, turn, step) {
         appendAck(session, entry.recordSeq, 'applied')
         appendBatchLedger(session, {
           batchId: entry.batchId ?? `pending-${entry.recordSeq}`,
-          op: 'delete',
+          op: ledgerOp,
           seqs: [entry.targetSeq],
           tombstoneSeqs,
           count: plan.count,
@@ -1132,8 +1164,39 @@ function parseCommand(rawInput) {
   if (head === 'clean') {
     const rest = text.slice(head.length).trim()
     if (rest.length === 0) return { op: 'invalid', reason: '缺少要释放的 token 预算。' }
-    if (!/^\d+$/.test(rest)) return { op: 'invalid', reason: '目标 token 数必须是正整数。' }
-    return { op: 'clean', targetTokens: Number(rest) }
+    const values = rest.split(/\s+/)
+    if (!/^\d+$/.test(values[0])) return { op: 'invalid', reason: '目标 token 数必须是正整数。' }
+    const parsed = { op: 'clean', targetTokens: Number(values[0]), dryRun: false }
+    for (let index = 1; index < values.length; index += 1) {
+      const flag = values[index].toLowerCase()
+      if (flag === '--dry-run' || flag === '--dryrun' || flag === '-d' || flag === 'dryrun' || flag === '预览') {
+        parsed.dryRun = true
+        continue
+      }
+      if (flag === '--min' || flag === '--min-candidates' || flag === '--mincandidates') {
+        const next = values[index + 1]
+        if (next === undefined || !/^\d+$/.test(next)) {
+          return { op: 'invalid', reason: '--min 需要一个非负整数（候选的最小估算 tokens）。' }
+        }
+        parsed.minCandidateTokens = Number(next)
+        index += 1
+        continue
+      }
+      if (flag === '--protect' || flag === '--protect-recent' || flag === '--protectrecent') {
+        const next = values[index + 1]
+        if (next === undefined || !/^\d+$/.test(next)) {
+          return { op: 'invalid', reason: '--protect 需要一个非负整数（保护最近几条）。' }
+        }
+        parsed.protectRecent = Number(next)
+        index += 1
+        continue
+      }
+      return {
+        op: 'invalid',
+        reason: `clean 不认识的选项 “${values[index]}”。可用：--dry-run / --min <n> / --protect <n>。`,
+      }
+    }
+    return parsed
   }
   if (head === 'compact') {
     const rest = text.slice(head.length).trim()
@@ -1170,7 +1233,7 @@ export function apply(ctx) {
   const command = ctx.commands.register({
     name: 'ctxmgr',
     description: '列出、批量删除或恢复当前会话中的单条消息，并按轮删除整轮对话，支持按 token 预算自动清理（仅移出/恢复模型上下文，保留原始日志）。',
-    input: { hint: 'list | turns | delete <序号,...> | deleteturn <轮号,...> | clean <目标tokens> | compact <起序号> <止序号> | batches | undo-batch [batchId] | restore <删除记录序号,...>' },
+    input: { hint: 'list | turns | delete <序号,...> | deleteturn <轮号,...> | clean <目标tokens> [--dry-run] [--min n] [--protect n] | compact <起序号> <止序号> | batches | undo-batch [batchId] | restore <删除记录序号,...>' },
     recordInput: false,
     async handler(invocation) {
       try {
@@ -1192,7 +1255,11 @@ export function apply(ctx) {
           return { kind: 'success', text: result.text }
         }
         if (parsed.op === 'clean') {
-          const result = await cleanMessages(ctx, invocation.agent, parsed.targetTokens, {})
+          const result = await cleanMessages(ctx, invocation.agent, parsed.targetTokens, {
+            dryRun: parsed.dryRun === true,
+            minCandidateTokens: parsed.minCandidateTokens,
+            protectRecent: parsed.protectRecent,
+          })
           return { kind: 'success', text: result.text }
         }
         if (parsed.op === 'compact') {
@@ -1211,7 +1278,7 @@ export function apply(ctx) {
           const result = await restoreMessages(ctx, invocation.agent, parsed.seqs)
           return { kind: 'success', text: result.text }
         }
-        return { kind: 'error', text: `${parsed.reason} 用法：/ctxmgr list | /ctxmgr turns | /ctxmgr delete <序号,...> | /ctxmgr deleteturn <轮号,...> | /ctxmgr clean <目标tokens> | /ctxmgr compact <起序号> <止序号> | /ctxmgr batches | /ctxmgr undo-batch [batchId] | /ctxmgr restore <删除记录序号,...>` }
+        return { kind: 'error', text: `${parsed.reason} 用法：/ctxmgr list | /ctxmgr turns | /ctxmgr delete <序号,...> | /ctxmgr deleteturn <轮号,...> | /ctxmgr clean <目标tokens> [--dry-run] [--min n] [--protect n] | /ctxmgr compact <起序号> <止序号> | /ctxmgr batches | /ctxmgr undo-batch [batchId] | /ctxmgr restore <删除记录序号,...>` }
       } catch (error) {
         return { kind: 'error', text: error instanceof Error ? error.message : String(error) }
       }
@@ -1220,7 +1287,7 @@ export function apply(ctx) {
 
   const tool = ctx.tools.register({
     name: 'context_manager',
-    description: 'Manage the model context of the current session. Actions: list (current messages with estimated tokens plus deleted records and queued operations), list-turns (conversation turns with turn numbers), delete (message seqs; any tool results tied to an assistant message that calls tools go with it), delete-turns (whole turns: the user prompt, the assistant work and reply, and that turn\'s injected context), compact (summarize exactly one user-selected surface span via the official ctx.compaction.compactRegion; only the named range, never a global threshold), clean (token-budget cleanup: automatically picks large tool/assistant messages ranked by estimated tokens descending, until target tokens are freed; user messages and the most recent messages are protected, and the planner reuses the same delete pipeline), restore (tombstone seqs from list; user/context restores at its original position, assistant content is appended at the tail). Typical uses: roll back to the start of a turn by deleting that turn and the ones after it, or drop noisy messages that no longer matter. All token figures are estimates from a 4-chars-per-token heuristic and can notably underprice CJK text and JSON. Deletion only affects later model requests; the raw session log and chat transcript are retained. Operations that cannot run safely yet are recorded durably in the session log and applied when the next step starts, surviving restarts. Use only when the user explicitly asks. Requires a live session.',
+    description: 'Manage the model context of the current session. Actions: list (current messages with estimated tokens plus deleted records and queued operations), list-turns (conversation turns with turn numbers), delete (message seqs; any tool results tied to an assistant message that calls tools go with it), delete-turns (whole turns: the user prompt, the assistant work and reply, and that turn\'s injected context), compact (summarize exactly one user-selected surface span via the official ctx.compaction.compactRegion; only the named range, never a global threshold), clean (token-budget cleanup: automatically picks large tool/assistant messages ranked by estimated tokens descending, until target tokens are freed; user messages and the most recent messages are protected, and the planner reuses the same delete pipeline), restore (tombstone seqs from list; user/context restores at its original position, assistant content is appended at the tail). Typical uses: roll back to the start of a turn by deleting that turn and the ones after it, or drop noisy messages that no longer matter. All token figures are estimates: ASCII text prices at 4 characters per token, CJK/full-width characters at about one token each, and dense JSON stays approximate. `clean` accepts `dryRun: true` to preview what a budget clean would remove (seqs + estimated tokens) without deleting anything. Deletion only affects later model requests; the raw session log and chat transcript are retained. Operations that cannot run safely yet are recorded durably in the session log and applied when the next step starts, surviving restarts. Use only when the user explicitly asks. Requires a live session.',
     parameters: {
       type: 'object',
       properties: {
@@ -1249,6 +1316,10 @@ export function apply(ctx) {
         protectRecent: {
           type: 'integer',
           description: 'For clean: optional number of most recent messages to protect (default 3).',
+        },
+        dryRun: {
+          type: 'boolean',
+          description: 'For clean: preview only — lists the seqs and estimated tokens a confirmed clean would remove, deletes nothing and writes no ledger entry.',
         },
         batchId: {
           type: 'string',
@@ -1308,6 +1379,7 @@ export function apply(ctx) {
           throw new Error('clean 需要正整数 targetTokens（要释放的 token 预算）。')
         }
         const result = await cleanMessages(ctx, exec.agent, args.targetTokens, {
+          dryRun: args?.dryRun === true,
           minCandidateTokens: args?.minCandidateTokens,
           protectRecent: args?.protectRecent,
         })

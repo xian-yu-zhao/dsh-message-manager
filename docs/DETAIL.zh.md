@@ -5,14 +5,18 @@
 - 让模型忘掉过时的中间结论：删掉被推翻的方案所在的轮次，避免它反复引用旧结论。
 - 止损边界：只移出模型上下文，原始会话日志与聊天记录仍留在本地会话文件里，本插件不是擦除工具。
 
-- token 估算：列表里的 `≈N tok` 与总占用来自 `core.js` 的 `estimateMessageTokens`，定价与 DSH 官方 `dsh-token-meter` 同源——4 字符 ≈ 1 token、每个内容块 +4、每条消息角色开销 +4。Host 有 token-meter 时优先用 `ctx.tokenMeter.measure()` 的节点定价，否则回退本地启发式。
-- 这只是估算：中文与 JSON 明显被低估，实际省下的 token 通常多于显示值。
-- 按预算清理：`/ctxmgr clean 60000`（工具等价 `context_manager` + `clean`）把 `tool` / `assistant` 候选按估算 token 降序删除，达到预算即停止。用户消息与上下文消息永不入选，默认保护最近 3 条，候选默认 ≥100 tokens；删除复用同一套墓碑与持久队列，仍可恢复。
+- token 估算：列表里的 `≈N tok`、总计与 `clean` 排序都来自 `core.js` 的 `estimateMessageTokens`。ASCII 文本沿用 `dsh-token-meter` 的密度（4 字符 ≈ 1 token）；CJK / 全角字符按约 1 字符 1 token 计价——旧的 4 字符规则把中文低估约四倍。每个内容块 +4、每条消息角色开销 +4 不变，空内容（墓碑）仍为 0。
+- Host 有 token-meter 时优先用 `ctx.tokenMeter.measure()` 的节点定价；没有时本地估算兜底，并用于 `clean` 排序、`≈N tok` 标签与总计。
+- 仍只是启发式估算：密集 JSON 与混排文本依旧只是近似，实际省下的 token 可能与显示值有差异。
+- 按预算清理：`/ctxmgr clean 60000`（参数 `--min <n>` / `--protect <n>`；工具等价 `context_manager` + `clean`，对应 `minCandidateTokens` / `protectRecent`）把 `tool` / `assistant` 候选按估算 token 降序删除，达到预算即停止。用户消息与上下文消息永不入选，默认保护最近 3 条，候选默认 ≥100 tokens；删除复用同一套墓碑与持久队列，仍可恢复。
+- 试运行：`/ctxmgr clean 60000 --dry-run`（别名 `-d` / `dryrun` / `预览`；工具 `action: 'clean'` + `dryRun: true`）列出确认执行时会移除的内容：候选池大小、将清理条数、预计释放 tokens，每条 `#序号 角色 ≈N tok · 预览`，外加 `确认执行：/ctxmgr clean <目标>` 行，候选池不够时给出差额提示。不删除任何消息、不写台账。预览与真实清理共用同一个 `planClean`，所以列出的序号就是确认清理会删掉的序号（表面未变的前提下）。
 
 - 批次审计：每次删除、整轮删除与按预算清理都会生成 `batchId`，写进墓碑消息的 `source`：`{ kind: 'context-manager', batchId: '<uuid>' }`。
 - `kind` 仍是唯一标记，因此旧墓碑没有 `batchId` 也照常识别与恢复。
 - 台账：每次操作在会话日志追加一条 `plugin:context-manager/batch` 记录——`batchId`、`op`（`delete` / `delete-turn` / `clean` / `undo`）、`seqs`、`tombstoneSeqs`、`estimatedFreedTokens`、结果（`applied` / `queued` / `skipped` / `failed`）与 `reason`。
 - 台账只增不改，随会话日志持久化，重启后仍可查，不写外部文件。
+- `/ctxmgr batches` 把这些记录按 `batchId` 归组、按批次一行显示：「先排队、后应用」的批次显示为 `排队中 → 成功` 一行，而不是两行、被误读成两次操作；批次与记录数不一致时表头显示 `共 N 个批次 / M 条记录`（`…另 N 个更早的批次未展开` 标记被显示上限折叠掉的更早批次）。日志本身仍只增不改，只有显示层分组；一个批次本来就可能有「排队」与「应用」两条记录。
+- 批次行汇总的是**真正落地**的记录：条数与释放 tokens 只累加 `applied` 记录（排队批次按目标逐条重放，所以这样才能给出正确合计），`skipped` / `failed` 目标不贡献任何数字。进程内已读到的台账记录按会话缓存且只增不减，扫描抖动不会让 `/ctxmgr batches` 瞬间读成空台账。排队操作保留自己的 `op`（`clean` 仍是 `clean`），台账记的是用户实际执行的操作。
 - 撤销：`/ctxmgr batches` 查看台账；`/ctxmgr undo-batch [batchId]` 撤销最近一次或按 batchId 前几位撤销指定批次（工具 `action=batches` / `action=undo-batch`）。
 - 撤销复用既有 restore 路径（持久队列 + ack 幂等），不是新的恢复机制，并会留下自己的 `op=undo` 台账记录。
 
