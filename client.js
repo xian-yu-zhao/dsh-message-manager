@@ -75,7 +75,7 @@ window.__ModuleLoader__.load({
       deleteTurn: '删除本轮',
       confirmBatchTurns: '确认删除选中的 {count} 轮对话？',
       turnsDeleted: '已提交删除 {count} 轮对话。',
-      inProgressNote: '进行中，下一回合生效',
+      inProgressNote: '进行中，下一次请求生效',
       noUserMessage: '（无用户提问）',
       turnMeta: '{count} 条',
       expandSection: '展开',
@@ -86,6 +86,13 @@ window.__ModuleLoader__.load({
       totalTokens: '当前总占用 ≈{tokens} tokens（估算）',
       cleanHint: '清理仅选取大体积工具/助手消息，按估算 token 降序，用户消息与最近 3 条受保护',
       protectedUser: '用户消息受保护',
+      filterLabel: '过滤',
+      filterAll: '全部',
+      filterRole: '只看 {role}',
+      filterEmpty: '没有符合过滤条件的消息。',
+      filterCount: '显示 {shown}/{total}',
+      protectedChip: '受保护',
+      recallChip: '可召回 #{seq}',
       userTokens: '用户 tokens（保护）：{tokens}',
       tokenSuffix: '≈{tokens} tok',
       cleanNote: '清理使用启发式估算，实际释放可能略有偏差',
@@ -155,6 +162,13 @@ window.__ModuleLoader__.load({
       totalTokens: 'Current usage ≈{tokens} tokens (estimated)',
       cleanHint: 'Cleaning picks only large tool/assistant messages ranked by estimated tokens; user messages and the most recent 3 messages are protected',
       protectedUser: 'User messages protected',
+      filterLabel: 'Filter',
+      filterAll: 'All',
+      filterRole: '{role} only',
+      filterEmpty: 'No messages match the filter.',
+      filterCount: 'showing {shown}/{total}',
+      protectedChip: 'protected',
+      recallChip: 'recall #{seq}',
       userTokens: 'User tokens (protected): {tokens}',
       tokenSuffix: '≈{tokens} tok',
       cleanNote: 'Cleaning uses heuristic estimates; actual relief may differ',
@@ -236,6 +250,13 @@ window.__ModuleLoader__.load({
 .dshmm-cleanlabel{font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary);flex:auto;min-width:0}
 .dshmm-cleaninput{appearance:none;border:0.5px solid var(--dsw-alias-border-l2);border-radius:6px;padding:4px 8px;font:inherit;font-size:11px;line-height:16px;width:96px;background:var(--dsw-alias-bg-overlay);color:var(--dsw-alias-label-primary);font-variant-numeric:tabular-nums}
 .dshmm-cleaninput:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}
+.dshmm-chip{flex:none;font-size:10px;line-height:15px;padding:0 6px;margin-top:2px;border-radius:5px;white-space:nowrap}
+.dshmm-chipProtect{color:var(--dsw-alias-brand-primary);background:color-mix(in srgb, var(--dsw-alias-brand-primary) 12%, transparent)}
+.dshmm-filterbar{display:flex;align-items:center;gap:8px;margin:8px 20px 0;flex:none;flex-wrap:wrap}
+.dshmm-filterLabel{font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary)}
+.dshmm-select{appearance:none;border:0.5px solid var(--dsw-alias-border-l2);border-radius:6px;padding:4px 8px;font:inherit;font-size:11px;line-height:16px;background:var(--dsw-alias-bg-overlay);color:var(--dsw-alias-label-primary);cursor:pointer}
+.dshmm-select:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}
+.dshmm-filterCount{font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary);font-variant-numeric:tabular-nums}
 @media (max-width:520px){.dshmm-backdrop{padding:10px}.dshmm-panel{max-height:90vh}.dshmm-footHint{display:none}.dshmm-reason{display:none}}
 `
 
@@ -446,6 +467,9 @@ window.__ModuleLoader__.load({
               batchId: typeof event.data?.message?.source?.batchId === 'string'
                 ? event.data.message.source.batchId
                 : undefined,
+              recall: Array.isArray(event.data?.message?.source?.recall)
+                ? event.data.message.source.recall
+                : [],
             })
           }
           seqs.splice(start, end - start + 1, event.seq)
@@ -635,6 +659,7 @@ window.__ModuleLoader__.load({
       // The per-message list is secondary to the turns view; start collapsed.
       const [currentCollapsed, setCurrentCollapsed] = useState(true)
       const [cleanBudget, setCleanBudget] = useState('20000')
+      const [roleFilter, setRoleFilter] = useState('all')
 
       useEffect(() => {
         const panel = panelRef.current
@@ -655,6 +680,9 @@ window.__ModuleLoader__.load({
       }, [manager, busy])
 
       const totalTokens = items.reduce((sum, item) => sum + (item.tokens ?? 0), 0)
+      // Filtering is a view concern only: selection, token totals and the Host
+      // planner still see the complete list.
+      const visibleItems = roleFilter === 'all' ? items : items.filter((item) => item.role === roleFilter)
       const currentSelectedSeqs = items.filter((item) => selectedItems.has(item.seq)).map((item) => item.seq)
       const restorableDeleted = deleted.filter((group) => group.restorable)
       const deletedSelectedSeqs = restorableDeleted
@@ -809,6 +837,9 @@ window.__ModuleLoader__.load({
           }),
         ),
         h('span', { className: 'dshmm-role' }, t(item.role)),
+        item.role === 'user'
+          ? h('span', { className: 'dshmm-chip dshmm-chipProtect', title: t('protectedUser') }, t('protectedChip'))
+          : null,
         h(
           'div',
           { className: 'dshmm-main' },
@@ -910,11 +941,14 @@ window.__ModuleLoader__.load({
 
       const renderDeleted = (group) => {
         const first = group.items[0]
-        const summary = group.count === 1
-          ? first === undefined
-            ? `#${group.targetSeqs[0]} · ${t('contentNotLoaded')}`
-            : `${t(first.role)} · ${first.preview || t('emptyMessage')}`
-          : `${t('deletedGroup')} · ${group.count}${first !== undefined && first.preview ? ` · ${first.preview}` : ''}`
+        const recalled = Array.isArray(group.recall) ? group.recall : []
+        const summary = first === undefined && recalled.length > 0
+          ? `${t('recallChip', { seq: recalled[0].seq })} · ${recalled[0].preview || t('emptyMessage')}`
+          : group.count === 1
+            ? first === undefined
+              ? `#${group.targetSeqs[0]} · ${t('contentNotLoaded')}`
+              : `${t(first.role)} · ${first.preview || t('emptyMessage')}`
+            : `${t('deletedGroup')} · ${group.count}${first !== undefined && first.preview ? ` · ${first.preview}` : ''}`
         const reasonKey = group.reason === 'appended'
           ? 'restoreAppended'
           : group.reason === 'tool'
@@ -1050,6 +1084,30 @@ window.__ModuleLoader__.load({
               ),
             ),
             h('p', { className: 'dshmm-subtitle' }, t('subtitle')),
+            h(
+              'div',
+              { className: 'dshmm-filterbar' },
+              h('span', { className: 'dshmm-filterLabel' }, t('filterLabel')),
+              h(
+                'select',
+                {
+                  className: 'dshmm-select',
+                  value: roleFilter,
+                  disabled: busy,
+                  'aria-label': t('filterLabel'),
+                  onChange: (event) => setRoleFilter(event.target.value),
+                },
+                h('option', { value: 'all' }, t('filterAll')),
+                ['user', 'assistant', 'tool', 'context'].map((role) => h(
+                  'option',
+                  { key: role, value: role },
+                  t('filterRole', { role: t(role) }),
+                )),
+              ),
+              roleFilter === 'all'
+                ? null
+                : h('span', { className: 'dshmm-filterCount' }, t('filterCount', { shown: visibleItems.length, total: items.length })),
+            ),
             h(
               'div',
               { className: 'dshmm-cleanbar' },
@@ -1193,7 +1251,10 @@ window.__ModuleLoader__.load({
                     ? h('div', { className: 'dshmm-empty' }, t('empty'))
                     : currentCollapsed
                       ? null
-                      : items.map(renderCurrent),
+                      : visibleItems.length === 0
+                        ? h('div', { className: 'dshmm-empty' }, t('filterEmpty'))
+                        : visibleItems.map(renderCurrent),
+
                   deleted.length === 0
                     ? null
                     : h(

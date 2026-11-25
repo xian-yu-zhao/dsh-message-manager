@@ -15,3 +15,9 @@
 - 台账只增不改，随会话日志持久化，重启后仍可查，不写外部文件。
 - 撤销：`/ctxmgr batches` 查看台账；`/ctxmgr undo-batch [batchId]` 撤销最近一次或按 batchId 前几位撤销指定批次（工具 `action=batches` / `action=undo-batch`）。
 - 撤销复用既有 restore 路径（持久队列 + ack 幂等），不是新的恢复机制，并会留下自己的 `op=undo` 台账记录。
+
+- 召回指针：每条墓碑的 `source` 是 `{ kind: 'context-manager', batchId, recall }`，其中 `recall` 最多 8 条 `{ seq, role, preview }`（`RECALL_MAX_ENTRIES = 8`），`preview` 截断到 80 字符（`RECALL_PREVIEW_LIMIT = 80`）。只存 seq、角色与一行摘要，不写消息全文；墓碑的 content 仍为空数组——墓碑必须投影成空消息。老墓碑没有这两个字段也照常工作。
+- 取回原文：`recall` 里的 `seq` 就是原始事件的会话序号，可用 `@deepseek-ai/dsh-tool-session-query` 的只读工具 `session_search` / `session_event_search` / `session_trace` / `session_event_trace` / `session_event_read` 按关键字检索或读取完整未删节事件（JSON）；搜索会排除调用方会话、按工作区 `cwd` 授权。所以「删除」是从主上下文卸载到可检索存档，不是擦除——与 `dsh-context-redline`（迁移走）和压缩插件（摘要掉）区分开。
+- 局部压缩：`/ctxmgr compact <起序号> <止序号>`（工具 `context_manager` + `action=compact`，参数 `start` / `end`）调用官方 `ctx.compaction.compactRegion(start, end, agentCtx, signal)`。start / end 是表面位置序号，不是数值大小顺序，两端必须工具配对平衡，否则引擎报 unbalanced。
+- 它只作用于用户选区，不做全局阈值压缩；需要环境加载压缩后端（如 `dsh-compaction-basic`），没加载时给明确中文提示并把失败写进台账。服务通过 `ctx.get('compaction')` 可选获取，插件不硬依赖；成功与失败都会在台账留一条 `op: 'compact'` 记录（含被遮蔽的节点数与 tokens）。与 delete / clean 的区别：delete / clean 是移出上下文、可恢复且无摘要，compact 是把一段换成一条官方摘要、不能按消息恢复，但原始会话日志仍只增不改。
+- 旧墓碑没有 `batchId` / `recall` 也照常工作；弹窗「已删除」行在拿不到原文时，用召回指针显示「可召回 #seq · 摘要」。

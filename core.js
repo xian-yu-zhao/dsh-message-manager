@@ -101,6 +101,7 @@ export function foldSurface(events) {
   let uncertain = false
   for (const event of events) {
     if (event === null || typeof event !== 'object') continue
+    if (!Number.isSafeInteger(event.seq)) continue // a log object without a seq cannot be indexed
     bySeq.set(event.seq, event)
     if (!SURFACE_TYPES.has(event.type)) continue
     const op = event.surfaceOp
@@ -253,7 +254,9 @@ export function planClean(items, targetTokens, options = {}) {
     .filter((item) => (item.role === 'tool' || item.role === 'assistant')
       && (item.tokens ?? 0) >= minTokens
       && !protectedSeqs.has(item.seq))
-    .sort((a, b) => (b.tokens ?? 0) - (a.tokens ?? 0))
+    // Total order: tokens descending, then surface order, so equal-priced
+    // candidates are always chosen deterministically.
+    .sort((a, b) => (b.tokens ?? 0) - (a.tokens ?? 0) || a.seq - b.seq)
   const chosen = []
   let estimatedFreedTokens = 0
   for (const candidate of candidates) {
@@ -302,6 +305,9 @@ export function planDeletion(events, targetSeq) {
   if (targetIndex < 0) return { ok: false, reason: 'not-found' }
   const target = events[targetIndex]
   if (target.type === 'system/message') return { ok: false, reason: 'system' }
+  // A tombstone is already an invisible replacement; deleting it would nest
+  // replacements and produce an empty recall pointer. Restore is the way out.
+  if (isTombstone(target)) return { ok: false, reason: 'tombstone' }
   if (target.type === 'tool/result' && typeof target.data?.message?.toolCallId !== 'string') {
     return { ok: false, reason: 'unsupported' }
   }
@@ -369,7 +375,35 @@ export function isTombstoneKind(kind) {
   return kind === TOMBSTONE_KIND || LEGACY_TOMBSTONE_KINDS.includes(kind)
 }
 
-/** Durable payload of an invisible replacement node. */
+/** Shortest useful recall pointer: how many removed messages one tombstone names. */
+export const RECALL_MAX_ENTRIES = 8
+/** Recall preview length; keeps the pointer tiny and avoids copying message text. */
+export const RECALL_PREVIEW_LIMIT = 80
+
+/**
+ * Build the recall pointer stored inside one tombstone.
+ *
+ * Each entry names the original seq, its role, and a one-line gist. The gist is
+ * an excerpt, never the full message, so a tombstone cannot leak content that
+ * the surrounding context no longer carries.
+ * @param events - originals being removed, in surface order.
+ * @returns recall entries, capped at {@link RECALL_MAX_ENTRIES}.
+ */
+export function buildRecall(events) {
+  const recall = []
+  for (const event of events) {
+    if (recall.length >= RECALL_MAX_ENTRIES) break
+    if (event === undefined || event === null || typeof event.seq !== 'number') continue
+    const message = event.type === 'user/message' ? event.data : event.data?.message
+    recall.push({
+      seq: event.seq,
+      role: roleOf(event),
+      preview: previewOf(message, RECALL_PREVIEW_LIMIT),
+    })
+  }
+  return recall
+}
+
 /**
  * Durable payload of an invisible replacement node.
  *
@@ -381,11 +415,23 @@ export function isTombstoneKind(kind) {
  * @param step - open step coordinate.
  * @param id - fresh message id for the invisible node.
  * @param batchId - optional batch identifier written into the source.
+ * @param recall - optional short pointers to the removed messages.
  */
-export function tombstoneData(turn, step, id, batchId = undefined) {
+export function tombstoneData(turn, step, id, batchId = undefined, recall = undefined) {
   const source = typeof batchId === 'string' && batchId.length > 0
     ? { kind: TOMBSTONE_KIND, batchId }
     : { kind: TOMBSTONE_KIND }
+  // A recall pointer turns "deleted" into "unloaded": the original seq and a
+  // one-line gist stay addressable from inside the tombstone, while no full
+  // message text is duplicated into the tombstone.
+  if (Array.isArray(recall) && recall.length > 0) {
+    // Copy the entries: the tombstone must not alias caller-owned objects.
+    source.recall = recall.slice(0, RECALL_MAX_ENTRIES).map((entry) => ({
+      seq: entry?.seq,
+      role: entry?.role,
+      preview: entry?.preview,
+    }))
+  }
   return {
     turn,
     step,
@@ -464,6 +510,9 @@ export function deletedFromSurface(events, bySeq) {
       batchId: typeof event.data?.message?.source?.batchId === 'string'
         ? event.data.message.source.batchId
         : undefined,
+      recall: Array.isArray(event.data?.message?.source?.recall)
+        ? event.data.message.source.recall
+        : [],
       targetSeqs: [...targets],
       count: targets.length,
       items: known.map((original) => ({
@@ -504,13 +553,21 @@ export function formatList(items, deleted = [], pending = [], limit = 30) {
     lines.push('', `已删除 ${deleted.length} 条记录（restore 使用 #后的删除记录序号）：`)
     for (const record of deleted.slice(-20)) {
       const first = record.items[0]
+      const recalled = Array.isArray(record.recall) ? record.recall : []
       const summary = record.items.length === 1 && first !== undefined
         ? `${first.role} · ${first.preview.length > 0 ? first.preview : '（空消息）'}`
-        : `删除组 · ${record.count} 条`
+        : record.items.length === 0 && recalled.length > 0
+          ? `召回指针 · #${recalled[0].seq} ${recalled[0].role} · ${recalled[0].preview.length > 0 ? recalled[0].preview : '（空消息）'}`
+          : `删除组 · ${record.count} 条`
       const note = record.restorable
         ? record.reason === 'appended' ? '恢复到末尾' : '恢复到原位置'
         : '不可恢复'
-      lines.push(`#${record.tombstoneSeq} ← ${summary}（${note}）`)
+      // Name the original seqs so a user can pull the exact events back with
+      // session_event_read instead of guessing from the tombstone seq.
+      const recallNote = recalled.length > 0
+        ? ` · 可召回 ${recalled.map((entry) => `#${entry.seq}`).join(',')}`
+        : ''
+      lines.push(`#${record.tombstoneSeq} ← ${summary}（${note}${recallNote}）`)
     }
   }
   lines.push('', '删除：/ctxmgr delete <序号,...>')
@@ -663,7 +720,7 @@ export function formatTurns(turns, limit = 50) {
   const omitted = turns.length - shown.length
   const lines = [`当前上下文中共 ${turns.length} 轮对话${omitted > 0 ? `，仅显示最近 ${shown.length} 轮` : ''}：`]
   for (const turn of shown) {
-    const mark = turn.inProgress ? '（进行中，删除将在下一回合生效）' : ''
+    const mark = turn.inProgress ? '（进行中，删除将在下一次请求生效）' : ''
     const tokensLabel = ` · ≈${(turn.tokens ?? 0).toLocaleString('en-US')} tok`
     lines.push(`T${turn.turn} · ${turn.preview.length > 0 ? turn.preview : '（无用户提问）'} · ${turn.messages.length} 条${tokensLabel}${mark}`)
   }

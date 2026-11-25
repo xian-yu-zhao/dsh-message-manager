@@ -78,7 +78,7 @@
 |---|---|---|
 | `dsh-context`（周下载很高、官方推荐） | 仪表板、成本图表、上下文占用可视化 | 不做仪表板与成本图表；我们只做就地裁剪 |
 | `dsh-compact-manager` / `dsh-compression-improved` | 全局阈值压缩、工具结果压缩引擎 | 不做全局压缩引擎；我们只在用户选区上删除或局部压缩 |
-| `dsh-context-redline` | 迁移到零历史的新会话 + 交接摘要 | 不做交接与迁移；我们不改消息内容，只在原会话里卸载 / 恢复 |
+| `dsh-context-redline` | 迁移到零历史的新会话 + 交接摘要 | 不做交接与迁移；我们不改消息内容，只把选中的内容从主上下文卸载到可检索存档（按 seq 可取回）或恢复 |
 | `@sulytwelve/dsh-context-manager`（同名）与各类 `dsh-memory` | 跨会话记忆 | 不做跨会话记忆 |
 
 与它们最本质的区别是**可逆性 + 原日志只增不改 + 按 seq 审计**：我们不重写任何消息内容，只追加空 developer 消息做表面替换；每一次删除、整轮删除与撤销都留在会话日志的台账里，可按批次追溯与撤回。
@@ -144,8 +144,8 @@ description:
 1. 打开任意会话，点标题栏右侧的列表图标，打开「上下文管理」。
 2. **预算 + 按 token 清理**（弹窗顶部一行）：填入目标 tokens 点清理，不用手挑也会优先清掉最占地方的工具与助手消息；规则见下。当前消息每行显示 `≈N tok`，列表标题显示当前上下文总占用——都是启发式估算，不是精确用量。
 3. **对话轮（整轮删除）**：一行一轮，显示轮号、预览与消息条数；勾选后点「删除选中」，或点行尾「删除本轮」。这一轮里的用户提问、助手的工作与回答、该轮注入的上下文会一起移出，不必逐条删工具调用。
-4. **当前消息**（默认折叠，点标题或 ▸ 展开）：按条勾选，点「删除选中」；也可点行尾垃圾桶单独删。折叠状态下全选与批量删除按钮仍可用。
-5. **已删除**：保留本插件产生的删除记录（`删除记录 #seq`），每行还显示所属批次号前 8 位；可勾选后「恢复选中」，或逐条「恢复」。弹窗底部另有「撤销上次操作」按钮，一次撤销最近一个批次。
+4. **当前消息**（默认折叠，点标题或 ▸ 展开）：按条勾选，点「删除选中」；也可点行尾垃圾桶单独删。折叠状态下全选与批量删除按钮仍可用。**过滤**下拉可切到 全部 / 用户 / 助手 / 工具 / 上下文：只影响显示，选择、token 总计与 Host 计划器都不受影响，过滤时显示「显示 X/Y」。用户消息行带「受保护」标记——`clean` 永不选择用户消息。
+5. **已删除**：保留本插件产生的删除记录（`删除记录 #seq`），每行还显示所属批次号前 8 位；可勾选后「恢复选中」，或逐条「恢复」。原文已不在当前表面时，行内改用召回指针显示「可召回 #seq · 摘要」，可凭该 seq 用 `session_event_read` 取回完整原始事件。弹窗底部另有「撤销上次操作」按钮，一次撤销最近一个批次。
 6. 删除只影响**后续模型请求**；恢复后重新进入后续请求。
 
 确认条会提示连带移除的总条数（`共移除 N 条消息`）与估算释放的 tokens（`估算释放约 X tokens`），因为删助手消息会带走它发起的工具结果，删工具结果会带走所属助手消息与同组结果。
@@ -159,13 +159,14 @@ description:
 /ctxmgr deleteturn <轮号,...>                 # 按轮删除
 /ctxmgr restore <删除记录序号,...>            # 恢复
 /ctxmgr clean <目标tokens>                    # 按预算清理：只看 tool / assistant，默认保护最近 3 条、候选 ≥100 tokens
+/ctxmgr compact <起序号> <止序号>             # 局部压缩：把用户选区交给官方 ctx.compaction.compactRegion
 /ctxmgr batches                               # 操作台账（审计）：列出批次号、操作、目标序号与结果
 /ctxmgr undo-batch [batchId]                  # 撤销最近一次操作；带 batchId 前几位时撤销指定批次（别名 undo-last）
 ```
 
 ### 工具
 
-模型可调用 `context_manager`，参数 `action` ∈ `list` / `list-turns` / `delete` / `delete-turns` / `restore` / `clean` / `batches` / `undo-batch`，`seqs` 按 action 解释为消息序号、轮号或删除记录序号（`clean` 不用 `seqs`）。工具描述里明确要求「仅在用户明确要求时使用」。
+模型可调用 `context_manager`，参数 `action` ∈ `list` / `list-turns` / `delete` / `delete-turns` / `restore` / `clean` / `compact` / `batches` / `undo-batch`，`seqs` 按 action 解释为消息序号、轮号或删除记录序号（`clean` 与 `compact` 不用 `seqs`；`compact` 改用 `start` / `end`，二者都是表面位置序号）。工具描述里明确要求「仅在用户明确要求时使用」。
 
 `clean` 按 token 预算清理，可选参数：
 
@@ -179,21 +180,23 @@ description:
 
 `action=batches` 列出操作台账；`action=undo-batch` 撤销最近一次操作，可选参数 `batchId`（前缀匹配）撤销指定批次。撤销复用既有 restore 路径（持久队列 + ack 幂等），并在台账里追加一条 `op=undo` 记录。
 
+`action=compact` 需要 `start` 与 `end` 两个参数：它们是**表面位置序号**，两端必须落在工具配对平衡的边界上；插件把这一段交给官方 `ctx.compaction.compactRegion` 换成一条摘要。调用契约、前提与和 delete / clean 的区别见下文「局部压缩」。
+
 ### 审计台账
 
-每次删除、整轮删除、按预算清理与撤销都会在会话日志里追加一条 `plugin:context-manager/batch` 审计记录，只增不改，随会话日志持久化——重启后仍可查，不写任何外部文件。
+每次删除、整轮删除、按预算清理、局部压缩与撤销都会在会话日志里追加一条 `plugin:context-manager/batch` 审计记录，只增不改，随会话日志持久化——重启后仍可查，不写任何外部文件。
 
 | 字段 | 含义 |
 |---|---|
 | `batchId` | 批次号；每次操作生成一个，撤销记录同样带 `batchId` |
-| `op` | 操作类型：`delete` / `delete-turn` / `clean` / `undo` |
+| `op` | 操作类型：`delete` / `delete-turn` / `clean` / `compact` / `undo` |
 | `seqs` | 本次操作的目标序号（消息序号或轮号） |
 | `tombstoneSeqs` | 实际写入的墓碑序号 |
 | `estimatedFreedTokens` | 估算释放的 tokens（启发式，非精确值） |
 | `result` | `applied` 成功 / `queued` 排队中 / `skipped` 跳过 / `failed` 失败 |
 | `reason` | 结果的原因说明 |
 
-批次号同时写进墓碑消息的 `source`：`source = { kind: 'context-manager', batchId: '<uuid>' }`。`kind` 仍是唯一标记，`batchId` 只是附加审计信息——旧墓碑没有 `batchId` 也照常工作。
+批次号同时写进墓碑消息的 `source`：`source = { kind: 'context-manager', batchId: '<uuid>', recall: [...] }`。`kind` 仍是唯一标记，`batchId` 与 `recall` 只是附加信息——旧墓碑没有这两个字段也照常工作（`recall` 见下节「召回」）。
 
 查看与撤销：
 
@@ -202,6 +205,55 @@ description:
 - `/ctxmgr undo-batch <batchId 前几位>`：撤销指定批次；工具等价 `action=undo-batch` + 可选 `batchId`。
 
 撤销**复用既有的 restore 路径**（持久队列 + ack 幂等），不是另起一套恢复机制；撤销本身也会在台账里留一条 `op=undo` 记录。
+
+### 局部压缩（与官方 compaction 分工）
+
+`/ctxmgr compact <起序号> <止序号>`（工具等价：`context_manager` + `action=compact`，参数 `start` / `end`）把用户选中的一段交给官方压缩引擎，换回一条官方摘要。
+
+**调用契约**：插件内部调用 `ctx.compaction.compactRegion(start, end, agentCtx, signal)`——这是本插件唯一借力官方压缩的地方，摘要逻辑本身不自己实现。
+
+- `start` / `end` 是**表面位置序号**，不是数值大小顺序；两端必须落在工具配对平衡的边界上（不能切在「助手工具调用」与「工具结果」之间），否则引擎报 unbalanced，操作失败并写进台账。
+- **需要压缩后端**：环境里必须加载了压缩后端（如 `dsh-compaction-basic`）。没加载时插件给明确的中文提示，并把失败记进台账；插件自身不硬依赖该服务，用 `ctx.get('compaction')` 可选获取。
+- **只作用于用户选区**：不做全局阈值压缩——那是 `dsh-compact-manager` 与压缩后端的事。你指哪一段，它压哪一段。
+- 成功与失败都会在台账留一条 `op: 'compact'` 记录（含被遮蔽的节点数与 tokens）。
+
+与 delete / clean 的区别：
+
+| 操作 | 结果 | 能否按消息恢复 |
+|---|---|---|
+| `delete` / `delete-turn` / `clean` | 目标从主上下文移出（墓碑投影成空消息） | 能，走 `restore` / `undo-batch` |
+| `compact` | 选区换成一条官方摘要 | 不能按消息恢复；原始事件仍留在只增不改的会话日志里 |
+
+一句话：delete / clean 是「卸载」，compact 是「摘要掉」，两者都不删除原始日志。
+
+### 召回：删掉的还能取回
+
+每条墓碑的 `source` 里现在带一个极短的**召回指针**：
+
+```js
+source = {
+  kind: 'context-manager',
+  batchId: '<uuid>',
+  recall: [{ seq: 42, role: 'assistant', preview: '……一行摘要……' }],
+}
+```
+
+- 最多 `RECALL_MAX_ENTRIES = 8` 条，`preview` 截断到 `RECALL_PREVIEW_LIMIT = 80` 字符。
+- 只存原始 `seq`、角色与一行摘要，**不写消息全文**；墓碑的 `content` 仍是空数组——墓碑必须投影成空消息，这是硬约束。
+- 与 `batchId` 并存；老墓碑没有这两个字段也照常工作。
+- 弹窗「已删除」行在拿不到原文时，用召回指针显示「可召回 #seq · 摘要」。
+
+**怎么取回原文**：`recall` 里的 `seq` 就是原始事件的会话序号。启用 `@deepseek-ai/dsh-tool-session-query` 那套只读工具后：
+
+| 工具 | 用途 |
+|---|---|
+| `session_event_search` | 在该会话内按关键字检索事件，定位被删的那一段 |
+| `session_event_read` | 按事件定位读取完整未删节事件（JSON） |
+| `session_search` / `session_event_trace` / `session_trace` | 找到会话、看事件轨迹与调用链 |
+
+搜索会排除调用方自己的会话、按工作区 `cwd` 授权。于是「删除」的准确定位是：**从主上下文卸载到可检索存档**——主上下文不再携带它（不再花 token，模型也看不见），但原始事件仍在 append-only 会话日志里，可按 seq / 关键字取回。
+
+与隔壁的区分：`dsh-context-redline` 把内容「迁移走」到新会话，压缩插件把内容「摘要掉」，我们只是把选中的内容「卸载」出主上下文，原会话与原文都还在原地。
 
 ### token 估算（启发式）
 
@@ -242,6 +294,7 @@ DSH 的会话格式要求 `developer/message` 必须位于一个已打开的 tur
 - 删除的实现是追加一条「空 developer 消息」做表面替换，符合会话日志只追加、可重放的约定。
 - 聊天视图展示历史记录，因此被删的消息**仍会出现在聊天记录里**；弹窗与后续模型请求使用当前表面。
 - 系统提示词、尚未落盘的消息（例如正在流式生成的消息）不在可删除范围内。
+- 删除记录（墓碑）本身不能再被当作消息删除：会提示该序号是一条删除记录、请改用 `restore`；`foldSurface` 会忽略缺 `seq` 的畸形表面对象。
 - 需要会话处于运行状态。
 - 纯本地运行：不联网、不外发任何数据。
 - 关闭插件后标题栏入口、`/ctxmgr` 命令与 `context_manager` 工具都会消失；已写入日志的删除记录仍然保留。
@@ -259,6 +312,7 @@ DSH 的会话格式要求 `developer/message` 必须位于一个已打开的 tur
 | `locale/*.json` | 插件管理页与详情页的标题、描述、详情文档路径 |
 | `docs/DETAIL*.md`、`docs/preview.svg` | 插件详情页的单图说明 |
 | `CHANGELOG.md` | 版本记录 |
+| `test/*.test.mjs` | 零依赖 `node:test` 用例，共 49 个（`node --test "test/*.test.mjs"`） |
 
 ### 关于 `@deepseek-ai/*` 引用
 
@@ -280,6 +334,22 @@ node --check core.js
 ```text
 plugin_manager remove_bundle   target=dsh-context-manager
 plugin_manager install_bundle  target=link:<插件目录>
+```
+
+### 测试
+
+`test/` 下三个零依赖 `node:test` 文件，共 49 个用例，只用内置模块，不需要安装任何依赖：
+
+| 文件 | 用例数 |
+|---|---|
+| `test/core.test.mjs` | 9 |
+| `test/batch.test.mjs` | 14 |
+| `test/surface.test.mjs` | 26 |
+
+覆盖 `planDeletion` 的工具组联动、`deletedFromSurface`、`foldSurface`（含缺 `seq` 的畸形对象）、`turnsFromSurface`、`planClean` 的保护与排序、`undo-batch` 的批次选择（含歧义前缀拒绝），以及召回指针与墓碑投影。
+
+```bash
+node --test "test/*.test.mjs"
 ```
 
 ## 发布（维护者）

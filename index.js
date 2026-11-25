@@ -31,6 +31,7 @@ import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import {
   addTurnTokens,
+  buildRecall,
   deletedFromSurface,
   formatBatches,
   matchUndoBatches,
@@ -190,7 +191,8 @@ function appendTombstones(session, runs, turn, step, batchId = undefined) {
     for (const run of runs) {
       const event = session.append(
         'developer/message',
-        tombstoneData(turn, step, randomUUID(), batchId),
+        tombstoneData(turn, step, randomUUID(), batchId,
+          buildRecall(run.seqs.map((seq) => session.eventAt(seq)).filter((event) => event !== undefined))),
         {
           surfaceOp: { op: 'replace', startSeq: run.startSeq, endSeq: run.endSeq },
           sourceEventSeqs: run.seqs,
@@ -352,6 +354,90 @@ async function listBatches(ctx, agent) {
   const session = liveSession(ctx, agent)
   const batches = batchesFromLog(ctx, session)
   return { text: formatBatches(batches), batches }
+}
+
+/**
+ * Compact exactly one user-selected surface span into a summary node.
+ *
+ * This is the only place this plugin borrows the official compaction engine,
+ * and it stays deliberately narrow: the span is whatever the user named by
+ * surface position, never a global pressure threshold (that is the compaction
+ * backend's own policy). Both edges must already be tool-pairing balanced; the
+ * engine rejects an unbalanced range, and we surface that reason verbatim.
+ */
+async function compactSelection(ctx, agent, start, end) {
+  const session = liveSession(ctx, agent)
+  const controller = new AbortController()
+  try {
+    // Resolve the optional service through ctx.get: compaction is not a hard
+    // dependency of this plugin, and reading ctx.compaction would make Cordis
+    // throw "cannot get property" for users who never loaded a backend.
+    const engine = ctx.get('compaction')
+    if (engine === undefined || engine === null || typeof engine.compactRegion !== 'function') {
+      throw new Error('当前环境没有加载 compaction 服务（ctx.compaction）；请先启用 dsh-compaction-basic 之类的压缩后端。')
+    }
+    const nodes = session.surface.nodes
+    if (!nodes.includes(start)) throw new Error(`起始序号 #${start} 不在当前表面上（/ctxmgr list 查看）。`)
+    if (!nodes.includes(end)) throw new Error(`结束序号 #${end} 不在当前表面上（/ctxmgr list 查看）。`)
+    if (nodes.indexOf(start) > nodes.indexOf(end)) {
+      throw new Error('起始序号必须位于结束序号之前（按表面位置，不是数值大小）。')
+    }
+    const options = agent !== null && typeof agent === 'object'
+      && agent.options !== null && typeof agent.options === 'object'
+      ? agent.options
+      : {}
+    const agentCtx = { session, options }
+    const result = await engine.compactRegion(start, end, agentCtx, controller.signal)
+    const shadowedSeqs = Array.isArray(result?.shadowedSeqs) ? result.shadowedSeqs : []
+    const tokens = Number.isSafeInteger(result?.shadowedTokenCount) ? result.shadowedTokenCount : 0
+    // Node count and token count use different scopes: our tombstones are real
+    // surface nodes (so they are counted) but derive no message (so they cost 0).
+    // Reporting only the live message count keeps the number meaningful.
+    let liveCount = 0
+    let tombstoneCount = 0
+    for (const seq of shadowedSeqs) {
+      if (isTombstone(session.eventAt(seq))) tombstoneCount += 1
+      else liveCount += 1
+    }
+    appendBatchLedger(session, {
+      batchId: randomUUID(),
+      op: 'compact',
+      seqs: [start, end],
+      tombstoneSeqs: [],
+      count: liveCount,
+      estimatedFreedTokens: 0,
+      result: 'applied',
+      reason: `shadowed ${liveCount} messages + ${tombstoneCount} tombstones / ${tokens} tokens`,
+    })
+    const tombNote = tombstoneCount > 0 ? `（另有 ${tombstoneCount} 个墓碑节点一并折叠，它们本就不占上下文）` : ''
+    return {
+      text: `已把表面区间 #${start}…#${end}（${liveCount} 条消息，估算 ${tokens.toLocaleString('en-US')} tokens${tombNote}）压缩成一条摘要消息。原始会话日志与聊天记录仍保留；这只作用于你选中的区间，不做全局阈值压缩。`,
+      count: liveCount,
+      tokens,
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    // The backend prices the shrink check against model-visible content only, so
+    // a span whose live content is mostly already deleted cannot be summarized.
+    // Say that plainly, and keep the ledger in the same language as the reply.
+    const shrink = /summary is not smaller than the shadowed content \((\d+) estimated framed tokens >= (\d+)\)/.exec(message)
+    const explanation = shrink !== null
+      ? `选区内模型可见内容只剩约 ${shrink[2]} tokens（墓碑不算内容），而摘要本身就约 ${shrink[1]} tokens，官方压缩会拒绝「摘要不比原文小」的情况。`
+      : message
+    appendBatchLedger(session, {
+      batchId: randomUUID(),
+      op: 'compact',
+      seqs: [start, end],
+      tombstoneSeqs: [],
+      estimatedFreedTokens: 0,
+      result: 'failed',
+      reason: explanation,
+    })
+    if (shrink !== null) {
+      throw new Error(`局部压缩失败：${explanation}建议改用 /ctxmgr delete 或 /ctxmgr clean 直接移出这段，而不是压缩它。`)
+    }
+    throw new Error(`局部压缩失败：${message}`)
+  }
 }
 
 /**
@@ -574,6 +660,9 @@ async function deleteMessages(ctx, agent, seqs, options = {}) {
     const plan = planDeletion(events, seq)
     if (!plan.ok) {
       if (plan.reason === 'system') throw new Error('系统提示词不是可删除的对话消息。')
+      if (plan.reason === 'tombstone') {
+        throw new Error('该序号是一条删除记录（墓碑），不是消息；要回到上下文请用 /ctxmgr restore。')
+      }
       if (plan.reason === 'not-found') {
         if (unique.length === 1) throw new Error('该消息已不在当前模型上下文中，可能已被删除；请刷新后重试。')
         continue
@@ -1024,6 +1113,13 @@ function parseCommand(rawInput) {
     if (!/^\d+$/.test(rest)) return { op: 'invalid', reason: '目标 token 数必须是正整数。' }
     return { op: 'clean', targetTokens: Number(rest) }
   }
+  if (head === 'compact') {
+    const rest = text.slice(head.length).trim()
+    const values = rest.length === 0 ? [] : rest.split(/[,\s]+/).filter(Boolean)
+    if (values.length !== 2) return { op: 'invalid', reason: 'compact 需要两个序号：起始与结束（按表面位置）。' }
+    if (values.some((value) => !/^\d+$/.test(value))) return { op: 'invalid', reason: 'compact 的两个序号必须是数字。' }
+    return { op: 'compact', start: Number(values[0]), end: Number(values[1]) }
+  }
   if (head === 'batches' || head === 'ledger' || head === 'audit') return { op: 'batches' }
   if (head === 'undo-batch' || head === 'undobatch' || head === 'undo-last' || head === 'undolast') {
     const rest = text.slice(head.length).trim()
@@ -1052,7 +1148,7 @@ export function apply(ctx) {
   const command = ctx.commands.register({
     name: 'ctxmgr',
     description: '列出、批量删除或恢复当前会话中的单条消息，并按轮删除整轮对话，支持按 token 预算自动清理（仅移出/恢复模型上下文，保留原始日志）。',
-    input: { hint: 'list | turns | delete <序号,...> | deleteturn <轮号,...> | clean <目标tokens> | batches | undo-batch [batchId] | restore <删除记录序号,...>' },
+    input: { hint: 'list | turns | delete <序号,...> | deleteturn <轮号,...> | clean <目标tokens> | compact <起序号> <止序号> | batches | undo-batch [batchId] | restore <删除记录序号,...>' },
     recordInput: false,
     async handler(invocation) {
       try {
@@ -1077,6 +1173,10 @@ export function apply(ctx) {
           const result = await cleanMessages(ctx, invocation.agent, parsed.targetTokens, {})
           return { kind: 'success', text: result.text }
         }
+        if (parsed.op === 'compact') {
+          const result = await compactSelection(ctx, invocation.agent, parsed.start, parsed.end)
+          return { kind: 'success', text: result.text }
+        }
         if (parsed.op === 'batches') {
           const result = await listBatches(ctx, invocation.agent)
           return { kind: 'success', text: result.text }
@@ -1089,7 +1189,7 @@ export function apply(ctx) {
           const result = await restoreMessages(ctx, invocation.agent, parsed.seqs)
           return { kind: 'success', text: result.text }
         }
-        return { kind: 'error', text: `${parsed.reason} 用法：/ctxmgr list | /ctxmgr turns | /ctxmgr delete <序号,...> | /ctxmgr deleteturn <轮号,...> | /ctxmgr clean <目标tokens> | /ctxmgr batches | /ctxmgr undo-batch [batchId] | /ctxmgr restore <删除记录序号,...>` }
+        return { kind: 'error', text: `${parsed.reason} 用法：/ctxmgr list | /ctxmgr turns | /ctxmgr delete <序号,...> | /ctxmgr deleteturn <轮号,...> | /ctxmgr clean <目标tokens> | /ctxmgr compact <起序号> <止序号> | /ctxmgr batches | /ctxmgr undo-batch [batchId] | /ctxmgr restore <删除记录序号,...>` }
       } catch (error) {
         return { kind: 'error', text: error instanceof Error ? error.message : String(error) }
       }
@@ -1098,13 +1198,13 @@ export function apply(ctx) {
 
   const tool = ctx.tools.register({
     name: 'context_manager',
-    description: 'Manage the model context of the current session. Actions: list (current messages with estimated tokens plus deleted records and queued operations), list-turns (conversation turns with turn numbers), delete (message seqs; any tool results tied to an assistant message that calls tools go with it), delete-turns (whole turns: the user prompt, the assistant work and reply, and that turn\'s injected context), clean (token-budget cleanup: automatically picks large tool/assistant messages ranked by estimated tokens descending, until target tokens are freed; user messages and the most recent messages are protected, and the planner reuses the same delete pipeline), restore (tombstone seqs from list; user/context restores at its original position, assistant content is appended at the tail). Typical uses: roll back to the start of a turn by deleting that turn and the ones after it, or drop noisy messages that no longer matter. All token figures are estimates from a 4-chars-per-token heuristic and can notably underprice CJK text and JSON. Deletion only affects later model requests; the raw session log and chat transcript are retained. Operations that cannot run safely yet are recorded durably in the session log and applied when the next step starts, surviving restarts. Use only when the user explicitly asks. Requires a live session.',
+    description: 'Manage the model context of the current session. Actions: list (current messages with estimated tokens plus deleted records and queued operations), list-turns (conversation turns with turn numbers), delete (message seqs; any tool results tied to an assistant message that calls tools go with it), delete-turns (whole turns: the user prompt, the assistant work and reply, and that turn\'s injected context), compact (summarize exactly one user-selected surface span via the official ctx.compaction.compactRegion; only the named range, never a global threshold), clean (token-budget cleanup: automatically picks large tool/assistant messages ranked by estimated tokens descending, until target tokens are freed; user messages and the most recent messages are protected, and the planner reuses the same delete pipeline), restore (tombstone seqs from list; user/context restores at its original position, assistant content is appended at the tail). Typical uses: roll back to the start of a turn by deleting that turn and the ones after it, or drop noisy messages that no longer matter. All token figures are estimates from a 4-chars-per-token heuristic and can notably underprice CJK text and JSON. Deletion only affects later model requests; the raw session log and chat transcript are retained. Operations that cannot run safely yet are recorded durably in the session log and applied when the next step starts, surviving restarts. Use only when the user explicitly asks. Requires a live session.',
     parameters: {
       type: 'object',
       properties: {
         action: {
           type: 'string',
-          enum: ['list', 'list-turns', 'delete', 'delete-turns', 'clean', 'batches', 'undo-batch', 'restore'],
+          enum: ['list', 'list-turns', 'delete', 'delete-turns', 'clean', 'compact', 'batches', 'undo-batch', 'restore'],
           description: 'list messages, list conversation turns, delete message seqs, delete whole turns by turn number, clean by token budget, list the batch audit ledger, undo a batch, or restore tombstone seqs.',
         },
         seq: {
@@ -1131,6 +1231,14 @@ export function apply(ctx) {
         batchId: {
           type: 'string',
           description: 'For undo-batch: optional batch id (or unambiguous prefix) from the ledger; omit to undo the most recent applied batch.',
+        },
+        start: {
+          type: 'integer',
+          description: 'For compact: first surface seq of the span to compact (inclusive, from list).',
+        },
+        end: {
+          type: 'integer',
+          description: 'For compact: last surface seq of the span to compact (inclusive, from list); both edges must be tool-pairing balanced.',
         },
       },
       required: ['action'],
@@ -1183,6 +1291,13 @@ export function apply(ctx) {
         })
         return { ok: true, text: result.text }
       }
+      if (action === 'compact') {
+        if (!Number.isSafeInteger(args?.start) || !Number.isSafeInteger(args?.end)) {
+          throw new Error('compact 需要整数 start 与 end（list 返回的表面序号）。')
+        }
+        const result = await compactSelection(ctx, exec.agent, args.start, args.end)
+        return { ok: true, text: result.text }
+      }
       if (action === 'batches') {
         const result = await listBatches(ctx, exec.agent)
         return { ok: true, text: result.text }
@@ -1197,7 +1312,7 @@ export function apply(ctx) {
         const result = await restoreMessages(ctx, exec.agent, list)
         return { ok: true, text: result.text }
       }
-      throw new Error('action 必须是 list、list-turns、delete、delete-turns、clean、batches、undo-batch 或 restore。')
+      throw new Error('action 必须是 list、list-turns、delete、delete-turns、clean、compact、batches、undo-batch 或 restore。')
     },
   })
 
