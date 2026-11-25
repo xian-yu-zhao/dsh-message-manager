@@ -434,6 +434,16 @@ async function compactSelection(ctx, agent, start, end) {
     if (shrink !== null) {
       throw new Error(`局部压缩失败：${explanation}建议改用 /ctxmgr delete 或 /ctxmgr clean 直接移出这段，而不是压缩它。`)
     }
+    // The engine reports boundary problems in English; translate the two shapes it
+    // emits so a Chinese user can act on them instead of reading engine internals.
+    const boundary = /compactRegion: (start|end) seq (\d+) is not a balanced boundary \((.+?)\)/.exec(message)
+    if (boundary !== null) {
+      const edge = boundary[1] === 'start' ? '起始' : '结束'
+      const why = boundary[3].includes('tool-call/result pair')
+        ? '会把一个工具调用与其结果拆开'
+        : '该步骤尚未结束，压缩不能截断一个进行中的步骤'
+      throw new Error(`局部压缩失败：${edge}序号 #${boundary[2]} 不是整步边界（${why}）。请把端点换成已结束步骤的首/末条消息序号（/ctxmgr list 查看）。`)
+    }
     throw new Error(`局部压缩失败：${message}`)
   }
 }
