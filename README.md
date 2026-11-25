@@ -7,6 +7,8 @@
 - 类型：Cordis bundle（Host 半 + Web Client 半），纯 JavaScript，**无构建、无第三方依赖**
 - 适用：DSH `0.2.1-rc.2` 及以上（`0.2.2-rc.5` 实测）
 
+> ⭐ **Star 一下，让我假装自己是个有影响力的开源作者。**
+
 ---
 
 ## 安装
