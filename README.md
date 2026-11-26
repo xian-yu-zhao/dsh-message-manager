@@ -4,7 +4,7 @@ A DSH (DeepSeek Harness) plugin that adds a **Context manager** entry to the ses
 
 *中文定位：在会话标题栏增加「上下文管理」入口，按条或按整轮移除模型上下文，之后还能恢复；原始会话日志、聊天记录与审计数据始终保留。*
 
-- Package: `dsh-context-manager` · Version: `1.7.3` · License: MIT
+- Package: `dsh-context-manager` · Version: `1.7.4` · License: MIT
 - Type: Cordis bundle (Host half + Web Client half), plain JavaScript, **no build step, no third-party dependencies**
 - Compatible with DSH `0.2.1-rc.2` and above (`0.2.2-rc.5` verified)
 
@@ -20,9 +20,9 @@ Long sessions accumulate error logs, pasted code, failed instructions, verbose t
 
 | Source | `target` value | Notes |
 |--------|----------------|-------|
-| npm | `dsh-context-manager@1.7.3` | [npm](https://www.npmjs.com/package/dsh-context-manager) |
+| npm | `dsh-context-manager@1.7.4` | [npm](https://www.npmjs.com/package/dsh-context-manager) |
 | GitHub | `github:xian-yu-zhao/dsh-context-manager` | No npm CLI needed |
-| Local tgz | `file:C:\path\to\dsh-context-manager-1.7.3.tgz` | Release asset / `npm pack` |
+| Local tgz | `file:C:\path\to\dsh-context-manager-1.7.4.tgz` | Release asset / `npm pack` |
 | Local dir | `link:C:\path\to\dsh-context-manager` | Dev install; reinstall to pick up Host edits |
 
 Refresh the Web page (F5) or restart after installing — a list icon appears on the right of the session title bar.
@@ -31,7 +31,7 @@ Migrating from the deprecated `dsh-message-manager` (1.5.0):
 
 ```text
 plugin_manager remove_bundle target=dsh-message-manager
-plugin_manager install_bundle target=dsh-context-manager@1.7.3
+plugin_manager install_bundle target=dsh-context-manager@1.7.4
 ```
 
 The new version still recognizes old tombstones (`kind: message-manager`) and queued records (`plugin:message-manager/pending` / `ack`) — no log cleanup needed. If npm only shows `0.0.0-stage`, staging review is pending; install from GitHub instead.
@@ -115,6 +115,7 @@ Recall pointers, audit-ledger fields, the local-compaction contract, token-estim
 
 ## Changelog
 
+- `1.7.4` — Patch: the dialog's estimate hints (zh + en) now describe the CJK-aware pricing instead of claiming CJK/JSON are underpriced. No functional change.
 - `1.7.3` — `clean --dry-run` preview (lists the seqs + estimated tokens a confirmed clean would remove; nothing deleted, no ledger entry); `/ctxmgr batches` now reads one row per batch (`排队中 → 成功`) and totals the batch's landed records while the log stays append-only; a queued `clean` is recorded as `clean` (not `delete`); CJK-aware token estimate (ASCII 4 chars/token, CJK / full-width ≈1 token per char). Docs: README rewritten in the English-led house style, `CONTRIBUTING.md` added, DETAIL docs expanded.
 - `1.7.2` — `compact` unbalanced errors translated into Chinese with actionable hints; ledger full-scans the session log.
 - `1.7.1` — Fixed empty `/ctxmgr batches` and queue cursor bugs; `undo-batch` no longer reselects undone batches.
