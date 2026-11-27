@@ -20,8 +20,8 @@ Long sessions accumulate error logs, pasted code, failed instructions, verbose t
 
 | Source | `target` value | Notes |
 |--------|----------------|-------|
-| npm | `dsh-context-manager@1.7.4` | [npm](https://www.npmjs.com/package/dsh-context-manager) |
-| GitHub | `github:xian-yu-zhao/dsh-context-manager` | No npm CLI needed |
+| npm (primary) | `dsh-context-manager@1.7.4` | Published on [npm](https://www.npmjs.com/package/dsh-context-manager); omit the version to take `latest` |
+| GitHub | `github:xian-yu-zhao/dsh-context-manager` | Same code straight from the repo; use when the registry is unreachable |
 | Local tgz | `file:C:\path\to\dsh-context-manager-1.7.4.tgz` | Release asset / `npm pack` |
 | Local dir | `link:C:\path\to\dsh-context-manager` | Dev install; reinstall to pick up Host edits |
 
@@ -34,9 +34,9 @@ plugin_manager remove_bundle target=dsh-message-manager
 plugin_manager install_bundle target=dsh-context-manager@1.7.4
 ```
 
-The new version still recognizes old tombstones (`kind: message-manager`) and queued records (`plugin:message-manager/pending` / `ack`) — no log cleanup needed. If npm only shows `0.0.0-stage`, staging review is pending; install from GitHub instead.
+The new version still recognizes old tombstones (`kind: message-manager`) and queued records (`plugin:message-manager/pending` / `ack`) — no log cleanup needed. The npm registry carries the full release line (`latest` = `1.7.4`); because npm forbids republishing a version, every fix ships under a new patch number, so install the version shown above or omit it to take `latest`. All sources install the same bundle id `include:context-manager` — pick one, do not install twice.
 
-**中文说明：** 任选来源安装；旧包 `dsh-message-manager` 已弃用，remove 旧包 + install 新包即可，旧日志照常识别。npm 只显示 `0.0.0-stage` 时改从 GitHub 装。
+**中文说明：** 任选来源安装，**npm 是主渠道**（`latest` 即表格里的 `1.7.4`），GitHub / tgz / 本地目录是同一份代码的备用来源；旧包 `dsh-message-manager` 已弃用，remove 旧包 + install 新包即可，旧日志照常识别。npm 不允许同版本重发，修复一律以补丁号发布，装表格里的版本或省略版本号取 `latest` 即可；同一插件 id 只装一份。
 
 ## Requirements
 
